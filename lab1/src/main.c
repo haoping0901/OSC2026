@@ -2,10 +2,7 @@
 
 int main(void)
 {
-    uart_puts("Hello World!1\n");
-    while (1) {
-        uart_putc(uart_getc());
-    }
+    shell();
 
     return 0;
 }
