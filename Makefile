@@ -1,24 +1,71 @@
 TOOLCHAIN ?= riscv64-unknown-elf
-CC = $(TOOLCHAIN)-gcc
-LD = $(TOOLCHAIN)-ld
+CC      = $(TOOLCHAIN)-gcc
+LD      = $(TOOLCHAIN)-ld
 OBJCOPY = $(TOOLCHAIN)-objcopy
-CFLAGS = -mcmodel=medany -ffreestanding -nostdlib -g -Wall
-CFLAGS += -I include
+MKIMAGE = mkimage
+
+# Set platform-specific flags
+# Default platform is qemu, can switch to opi with make PLATFORM=opi
+PLATFORM ?= qemu
+
+ifeq ($(PLATFORM), qemu)
+    KERNEL_BASE = 0x80200000
+    PLAT_CFLAGS = -DQEMU
+else ifeq ($(PLATFORM), opi)
+    KERNEL_BASE = 0x00200000
+    PLAT_CFLAGS = 
+endif
+
+# Set paths
+SRC_DIR   = src
+BUILD_DIR = build/$(PLATFORM)
+TARGET    = kernel
+
+CFLAGS  = -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
+LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE)
+
+# Source files and corresponding object files
+C_SRCS := $(wildcard $(SRC_DIR)/*.c)
+S_SRCS := $(wildcard $(SRC_DIR)/*.S)
+OBJS   := $(C_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) \
+          $(S_SRCS:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o)
+
+.PHONY: all clean run qemu opi
+
+all: $(TARGET).fit
+
+# shortcut targets
+qemu:
+	@$(MAKE) PLATFORM=qemu all
+
+opi:
+	@$(MAKE) PLATFORM=opi all
+
+# Compile rules
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET).elf: $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(TARGET).bin: $(TARGET).elf
+	$(OBJCOPY) -O binary $< $@
+	cp $@ kernel_$(PLATFORM).bin
+
+$(TARGET).fit: $(TARGET).bin
+	$(MKIMAGE) -f kernel.its $@
+
+# Run the kernel in QEMU
 QEMU = qemu-system-riscv64
-TARGET = kernel
-KERNEL_BASE ?= 0x00200000
+QEMU_OPTS = -M virt -m 8G -display none -serial pty
 
-all: clean
-	$(CC) $(CFLAGS) -c src/*.S src/*.c
-	# $(LD) -T src/linker.ld -o $(TARGET).elf *.o
-	$(LD) -T src/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) -o $(TARGET).elf *.o
-	$(OBJCOPY) -O binary $(TARGET).elf $(TARGET).bin
-	mkimage -f kernel.its kernel.fit
-
-test: CFLAGS += -DQEMU
-test: KERNEL_BASE = 0x80200000
-test: all $(TARGET).bin
-	$(QEMU) -M virt -m 8G -kernel $(TARGET).bin -display none -serial stdio
+test: qemu
+	$(QEMU) $(QEMU_OPTS) -kernel $(TARGET).bin
 
 clean:
-	rm -f $(TARGET) $(TARGET).elf *.o *.bin kernel *.fit
+	rm -rf build $(TARGET).elf $(TARGET)*.bin $(TARGET).fit

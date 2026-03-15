@@ -126,7 +126,7 @@ static inline unsigned int mmio_read(unsigned long addr)
 #endif // !QEMU 
 }
 
-#ifndef QEMU
+#if 0
 static void uart_clk_enable(unsigned char fnclksel)
 {
     unsigned long clk_rst_addr = APBCLK_BASE + 0x00;
@@ -166,7 +166,7 @@ void uart_init(void)
     /* --- Enable UART unit, no interrupt, no DMA --- */
     mmio_write32(UART_BASE + UART_IER, IER_UUE);
 }
-#endif // !QEMU
+#endif // 0
 
 /* -----------------------------------------------------------------------
  * uart_getc() – receive one byte (blocking poll)
@@ -190,6 +190,19 @@ int uart_getc(void)
 
     ch = mmio_read(UART_BASE + UART_RBR) & 0xFF;
     return ch == '\r' ? '\n' : ch;
+}
+
+int uart_getc_raw(void) {
+    unsigned int lsr;
+
+    do {
+        lsr = mmio_read(UART_BASE + UART_LSR);
+    } while (!(lsr & LSR_DR));
+
+    if (lsr & (LSR_OE | LSR_PE | LSR_FE | LSR_BI))
+        return -1;
+
+    return mmio_read(UART_BASE + UART_RBR) & 0xFF;
 }
 
 

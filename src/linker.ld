@@ -19,6 +19,7 @@ SECTIONS
         *(.data)
     }
 
+    . = ALIGN(8);
     .bss : {
         *(.sbss)
         *(.bss)
@@ -28,6 +29,6 @@ SECTIONS
     _sbss = ADDR(.bss);
     _ebss = ADDR(.bss) + SIZEOF(.bss);
 
-    . = ALIGN(8);
+    . = ALIGN(16);
     _stack_top = . + 0x1000; /* reserve 4KB for stack */
 }
