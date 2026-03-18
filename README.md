@@ -22,7 +22,7 @@ sudo apt update && sudo apt install u-boot-tools
 
 ## FAQ
 
-### 要如何確認 QEMU 的 UART base address 以及 register layout?
+### Lab1: 要如何確認 QEMU 的 UART base address 以及 register layout?
 
 1. 確認 QEMU 啟動時使用的 device tree。
 
@@ -50,3 +50,7 @@ dtc -I dtb -O dts virt.dtb > qemu_dtb.txt
 		};
 ...
 ```
+
+### Lab2: 哪裡規定了 `a1` register 必須放 dtb address 的？
+
+OpenSBI [官方 github](https://github.com/riscv-software-src/opensbi/blob/master/docs/firmware/fw.md) 定義了在 RISC-V 架構中，前一個啟動階段會透過 `a1` 暫存器將 DTB 位址傳給 OpenSBI。

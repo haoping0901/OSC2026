@@ -22,7 +22,7 @@ BUILD_DIR = build/$(PLATFORM)
 TARGET    = kernel
 
 CFLAGS  = -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
-LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE)
+LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) --no-warn-rwx-segments
 
 # Source files and corresponding object files
 C_SRCS := $(wildcard $(SRC_DIR)/*.c)
@@ -62,7 +62,7 @@ $(TARGET).fit: $(TARGET).bin
 
 # Run the kernel in QEMU
 QEMU = qemu-system-riscv64
-QEMU_OPTS = -M virt -m 8G -display none -serial pty
+QEMU_OPTS = -M virt -m 8G -display none -serial stdio
 
 test: qemu
 	$(QEMU) $(QEMU_OPTS) -kernel $(TARGET).bin

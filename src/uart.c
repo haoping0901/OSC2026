@@ -1,17 +1,16 @@
 #include "uart.h"
+#include "types.h"
 
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long uintptr_t;
-typedef unsigned long size_t;
+/* Runtime UART base address – overridden by uart_set_base() after DTB parse */
+static volatile unsigned long g_uart_base;
 
-#ifndef QEMU
-#define UART_BASE 0xD4017000UL
-#else
-// https://github.com/qemu/qemu/blob/master/hw/riscv/virt.c#L95
-#define UART_BASE 0x10000000UL
-#endif // !QEMU
+void uart_set_base(unsigned long base)
+{
+    if (base)
+        g_uart_base = base;
+}
+
+#define UART_BASE g_uart_base
 
 #ifndef QEMU
 #define UART_RBR    0x00
