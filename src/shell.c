@@ -2,6 +2,7 @@
 #include "sbi.h"
 #include "utils.h"
 #include "dtb.h"
+#include "cpio.h"
 
 #define SHELL_BUF_SIZE 128
 
@@ -18,6 +19,8 @@ static void shell_print_help(void)
     uart_puts("  hello - print Hello world.\n");
     uart_puts("  info  - print system info.\n");
     uart_puts("  load  - receive kernel over UART and boot.\n");
+    uart_puts("  ls    - list files in the initial ramdisk.\n");
+    uart_puts("  cat   - print content of a file in the initial ramdisk.\n");
 }
 
 static void shell_load_kernel(void)
@@ -104,6 +107,21 @@ static void shell_handle_command(const char *cmd)
         shell_print_info();
     } else if (str_eq(cmd, "load") != 0) {
         shell_load_kernel();
+    } else if (str_eq(cmd, "ls") != 0) {
+        cpio_ls((void *)dtb_getprop("/chosen", "linux,initrd-start"));
+    } else if (str_startswith(cmd, "cat ")) {
+        const char *filename = cmd + 4;
+        /* skip leading spaces */
+        while (*filename == ' ') {
+            filename++;
+        }
+        if (*filename == '\0') {
+            uart_puts("usage: cat <filename>\n");
+        } else {
+            cpio_cat((void *)dtb_getprop("/chosen", "linux,initrd-start"), filename);
+        }
+    } else if (str_eq(cmd, "cat") != 0) {
+        uart_puts("usage: cat <filename>\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);

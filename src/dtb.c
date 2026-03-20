@@ -133,7 +133,7 @@ void *dtb_get_addr(void)
  * Returns a pointer to the raw property data, or NULL on failure.
  * The data is big-endian; callers must byte-swap as needed.
  */
-const void *dtb_getprop(const char *node_path, const char *prop_name,
+const void *_dtb_getprop(const char *node_path, const char *prop_name,
                        int *lenp)
 {
     if (!g_dtb_addr || !node_path || !prop_name)
@@ -261,10 +261,10 @@ const void *dtb_getprop(const char *node_path, const char *prop_name,
     return 0;
 }
 
-uintptr_t dtb_get_reg(const char *path)
+uintptr_t dtb_getprop(const char *path, const char *prop_name)
 {
     int len = 0;
-    const void *value = dtb_getprop(path, "reg", &len);
+    const void *value = _dtb_getprop(path, prop_name, &len);
     if (!value || len < 4)
         return 0;
 

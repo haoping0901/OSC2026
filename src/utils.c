@@ -10,6 +10,18 @@ int str_eq(const char *a, const char *b)
     return (*a == '\0' && *b == '\0');
 }
 
+int str_startswith(const char *str, const char *prefix)
+{
+    while (*prefix) {
+        if (*str != *prefix) {
+            return 0;
+        }
+        ++str;
+        ++prefix;
+    }
+    return 1;
+}
+
 void print_hex_ulong(unsigned long x)
 {
     char buf[2 * sizeof(unsigned long)];

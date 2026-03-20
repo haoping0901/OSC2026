@@ -16,7 +16,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
      * Both boards use the same logical path; node_name_match() in dtb.c
      * handles the "@<unit-addr>" suffix transparently.
      */
-    uintptr_t u_base = dtb_get_reg("/soc/serial");
+    uintptr_t u_base = dtb_getprop("/soc/serial", "reg");
 
     /* Step 3: Override the UART driver's base address before first use. */
     uart_set_base((unsigned long)u_base);

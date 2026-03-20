@@ -57,15 +57,22 @@ $(TARGET).bin: $(TARGET).elf
 	$(OBJCOPY) -O binary $< $@
 	cp $@ kernel_$(PLATFORM).bin
 
-$(TARGET).fit: $(TARGET).bin
+$(TARGET).fit: $(TARGET).bin initramfs.cpio
 	$(MKIMAGE) -f kernel.its $@
 
 # Run the kernel in QEMU
 QEMU = qemu-system-riscv64
 QEMU_OPTS = -M virt -m 8G -display none -serial stdio
 
-test: qemu
-	$(QEMU) $(QEMU_OPTS) -kernel $(TARGET).bin
+rootfs/hello.txt:
+	mkdir -p rootfs
+	echo "Hello world from initramfs!" > rootfs/hello.txt
+
+initramfs.cpio: rootfs/hello.txt
+	cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio
+
+test: qemu initramfs.cpio
+	$(QEMU) $(QEMU_OPTS) -kernel $(TARGET).bin -initrd initramfs.cpio
 
 clean:
-	rm -rf build $(TARGET).elf $(TARGET)*.bin $(TARGET).fit
+	rm -rf build rootfs $(TARGET).elf $(TARGET)*.bin $(TARGET).fit *.cpio
