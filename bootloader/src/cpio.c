@@ -55,6 +55,9 @@ void cpio_ls(const void *archive)
     }
 
     const char *ptr = (const char *)archive;
+    uart_puts("cpio: Found initrd at 0x");
+    print_hex_ulong((unsigned long)archive);
+    uart_puts("\n");
     while (1) {
         const struct cpio_newc_header *hdr = (const struct cpio_newc_header *)ptr;
 

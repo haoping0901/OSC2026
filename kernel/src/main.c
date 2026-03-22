@@ -1,7 +1,7 @@
 #include "uart.h"
 #include "shell.h"
 #include "dtb.h"
-#include "utils.h"
+#include "types.h"
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
@@ -19,13 +19,10 @@ int main(unsigned long hart_id, void *dtb_ptr)
     uintptr_t u_base = dtb_getprop("/soc/serial", "reg");
 
     /* Step 3: Override the UART driver's base address before first use. */
-    uart_set_base((unsigned long)u_base);
+    uart_set_base(u_base);
 
     /* Step 4: Announce the resolved address (sanity check). */
-    uart_puts("\nWelcome to OPI-RV2!\n");
-    uart_puts("UART base = 0x");
-    print_hex_ulong(u_base);
-    uart_puts("\n\n");
+    uart_puts("Welcome to OPI-RV2!\n");
 
     /* Step 5: Continue with the interactive shell. */
     shell();
