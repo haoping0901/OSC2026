@@ -1,2 +1,7 @@
 *.o
 *.pdf
+.vscode
+*.bin
+*.elf
+*.fit
+*.cpio

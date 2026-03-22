@@ -1,17 +1,16 @@
 #include "uart.h"
+#include "types.h"
 
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long uintptr_t;
-typedef unsigned long size_t;
+/* Runtime UART base address – overridden by uart_set_base() after DTB parse */
+static volatile unsigned long g_uart_base;
 
-#ifndef QEMU
-#define UART_BASE 0xD4017000UL
-#else
-// https://github.com/qemu/qemu/blob/master/hw/riscv/virt.c#L95
-#define UART_BASE 0x10000000UL
-#endif // !QEMU
+void uart_set_base(unsigned long base)
+{
+    if (base)
+        g_uart_base = base;
+}
+
+#define UART_BASE g_uart_base
 
 #ifndef QEMU
 #define UART_RBR    0x00
@@ -126,7 +125,7 @@ static inline unsigned int mmio_read(unsigned long addr)
 #endif // !QEMU 
 }
 
-#ifndef QEMU
+#if 0
 static void uart_clk_enable(unsigned char fnclksel)
 {
     unsigned long clk_rst_addr = APBCLK_BASE + 0x00;
@@ -166,7 +165,7 @@ void uart_init(void)
     /* --- Enable UART unit, no interrupt, no DMA --- */
     mmio_write32(UART_BASE + UART_IER, IER_UUE);
 }
-#endif // !QEMU
+#endif // 0
 
 /* -----------------------------------------------------------------------
  * uart_getc() – receive one byte (blocking poll)
@@ -190,6 +189,19 @@ int uart_getc(void)
 
     ch = mmio_read(UART_BASE + UART_RBR) & 0xFF;
     return ch == '\r' ? '\n' : ch;
+}
+
+int uart_getc_raw(void) {
+    unsigned int lsr;
+
+    do {
+        lsr = mmio_read(UART_BASE + UART_LSR);
+    } while (!(lsr & LSR_DR));
+
+    if (lsr & (LSR_OE | LSR_PE | LSR_FE | LSR_BI))
+        return -1;
+
+    return mmio_read(UART_BASE + UART_RBR) & 0xFF;
 }
 
 
