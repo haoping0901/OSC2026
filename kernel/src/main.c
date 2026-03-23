@@ -2,6 +2,7 @@
 #include "shell.h"
 #include "dtb.h"
 #include "types.h"
+#include "buddy.h"
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
@@ -24,7 +25,10 @@ int main(unsigned long hart_id, void *dtb_ptr)
     /* Step 4: Announce the resolved address (sanity check). */
     uart_puts("Welcome to OPI-RV2!\n");
 
-    /* Step 5: Continue with the interactive shell. */
+    /* Step 5: Initialise the buddy page-frame allocator. */
+    buddy_init();
+
+    /* Step 6: Continue with the interactive shell. */
     shell();
 
     return 0;
