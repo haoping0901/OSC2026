@@ -163,7 +163,7 @@ static void block_pop(unsigned long idx, int order)
 
 void buddy_init(void)
 {
-    /* Initialise all free list heads. */
+    /* Initialize all free list heads. */
     for (int i = 0; i <= MAX_ORDER; i++)
         INIT_LIST_HEAD(&free_list[i]);
 
@@ -193,7 +193,7 @@ void buddy_init(void)
         idx += (1UL << order);
     }
 
-    uart_puts("[Buddy] Initialised: ");
+    uart_puts("[Buddy] Initialized: ");
     print_dec_ulong(TOTAL_PAGES);
     uart_puts(" pages (");
     print_dec_ulong(TOTAL_PAGES * PAGE_SIZE / 1024 / 1024);

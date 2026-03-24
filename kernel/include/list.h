@@ -13,7 +13,7 @@ struct list_head {
     struct list_head *next;
 };
 
-/* ---- Initialisation ---------------------------------------------------- */
+/* ---- Initialization ---------------------------------------------------- */
 
 #define LIST_HEAD_INIT(name) { &(name), &(name) }
 

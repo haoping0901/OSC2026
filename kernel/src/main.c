@@ -3,6 +3,7 @@
 #include "dtb.h"
 #include "types.h"
 #include "buddy.h"
+#include "kmalloc.h"
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
@@ -25,10 +26,13 @@ int main(unsigned long hart_id, void *dtb_ptr)
     /* Step 4: Announce the resolved address (sanity check). */
     uart_puts("Welcome to OPI-RV2!\n");
 
-    /* Step 5: Initialise the buddy page-frame allocator. */
+    /* Step 5: Initialize the buddy page-frame allocator. */
     buddy_init();
 
-    /* Step 6: Continue with the interactive shell. */
+    /* Step 6: Initialize the dynamic memory allocator (chunk pools). */
+    kmalloc_init();
+
+    /* Step 7: Continue with the interactive shell. */
     shell();
 
     return 0;

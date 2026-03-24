@@ -28,7 +28,7 @@
 /* ---------- Public API -------------------------------------------------- */
 
 /**
- * Initialise the buddy allocator.
+ * Initialize the buddy allocator.
  * Must be called once at boot, after UART is ready (for log output).
  */
 void buddy_init(void);

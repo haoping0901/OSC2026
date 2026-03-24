@@ -4,6 +4,7 @@
 #include "dtb.h"
 #include "cpio.h"
 #include "buddy.h"
+#include "kmalloc.h"
 #include "types.h"
 
 #define SHELL_BUF_SIZE 128
@@ -30,55 +31,54 @@ static void shell_print_help(void)
 
 static void test_alloc_1(void)
 {
-    uart_puts("=== Testing page frame allocation ===\n");
+    uart_puts("Testing memory allocation...\n");
 
-    uart_puts("alloc 4000\n");
-    char *ptr1 = (char *)buddy_alloc(4000);
-    uart_puts("alloc 8000\n");
-    char *ptr2 = (char *)buddy_alloc(8000);
-    uart_puts("alloc 4000\n");
-    char *ptr3 = (char *)buddy_alloc(4000);
-    uart_puts("alloc 4000\n");
-    char *ptr4 = (char *)buddy_alloc(4000);
+    /* Page-level allocations (> MAX_CHUNK_SIZE → buddy) */
+    char *ptr1 = (char *)kmalloc(4000);
+    char *ptr2 = (char *)kmalloc(8000);
+    char *ptr3 = (char *)kmalloc(4000);
+    char *ptr4 = (char *)kmalloc(4000);
 
-    uart_puts("free 4000\n");
-    buddy_free(ptr1);
-    uart_puts("free 8000\n");
-    buddy_free(ptr2);
-    uart_puts("free 4000\n");
-    buddy_free(ptr3);
-    uart_puts("free 4000\n");
-    buddy_free(ptr4);
+    kfree(ptr1);
+    kfree(ptr2);
+    kfree(ptr3);
+    kfree(ptr4);
 
-    uart_puts("alloc 16\n");
-    char *ptr5 = (char *)buddy_alloc(16);
-    uart_puts("alloc 32\n");
-    char *ptr6 = (char *)buddy_alloc(32);
+    /* Chunk-level allocations */
+    uart_puts("Testing dynamic allocator...\n");
+    char *kmem_ptr1 = (char *)kmalloc(16);
+    char *kmem_ptr2 = (char *)kmalloc(32);
+    char *kmem_ptr3 = (char *)kmalloc(64);
+    char *kmem_ptr4 = (char *)kmalloc(128);
+    char *kmem_ptr5 = (char *)kmalloc(16);
+    char *kmem_ptr6 = (char *)kmalloc(32);
 
-    uart_puts("free 16\n");
-    buddy_free(ptr5);
-    uart_puts("free 32\n");
-    buddy_free(ptr6);
+    kfree(kmem_ptr1);
+    kfree(kmem_ptr2);
+    kfree(kmem_ptr3);
+    kfree(kmem_ptr4);
+    kfree(kmem_ptr5);
+    kfree(kmem_ptr6);
 
-    // Test allocate new page if the cache is not enough
-    void *ptr[102];
+    /* Test allocate new page if the cache is not enough */
+    void *kmem_ptr[102];
     for (int i = 0; i < 100; i++) {
-        ptr[i] = (char *)buddy_alloc(128);
+        kmem_ptr[i] = (char *)kmalloc(128);
     }
     for (int i = 0; i < 100; i++) {
-        buddy_free(ptr[i]);
+        kfree(kmem_ptr[i]);
     }
 
-    // Test exceeding the maximum size
-    char *ptr7 = (char *)buddy_alloc(TOTAL_PAGES * PAGE_SIZE + 1);
-    if (ptr7 == NULL) {
+    /* Test exceeding the maximum size */
+    char *kmem_ptr7 = (char *)kmalloc(TOTAL_PAGES * PAGE_SIZE + 1);
+    if (kmem_ptr7 == NULL) {
         uart_puts("Allocation failed as expected for size > MAX_ALLOC_SIZE\n");
     } else {
         uart_puts("Unexpected allocation success for size > MAX_ALLOC_SIZE\n");
-        buddy_free(ptr7);
+        kfree(kmem_ptr7);
     }
 
-    uart_puts("=== Page frame allocation test done ===\n");
+    uart_puts("=== Memory allocation test done ===\n");
 }
 
 static void shell_load_kernel(void)
