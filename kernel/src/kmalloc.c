@@ -38,10 +38,11 @@ static pool_t pools[NUM_POOLS];
 
 /*
  * Page-to-pool mapping.
- * Index = (page_phys_addr - BUDDY_BASE) / PAGE_SIZE
+ * Index = (page_phys_addr - buddy_get_base()) / PAGE_SIZE
  * Value = pool index (0..NUM_POOLS-1) or -1 for large / buddy-only pages.
+ * Sized for the maximum managed region (MAX_PAGES).
  */
-static signed char page_pool_idx[TOTAL_PAGES];
+static signed char page_pool_idx[MAX_PAGES];
 
 /* ---- Helpers ----------------------------------------------------------- */
 
@@ -55,10 +56,10 @@ static int find_pool(unsigned long size)
     return -1;  /* too large for any pool */
 }
 
-/** Convert a physical address to a page-frame index (relative to BUDDY_BASE). */
+/** Convert a physical address to a page-frame index (relative to buddy base). */
 static inline unsigned long addr_to_page_idx(uintptr_t addr)
 {
-    return (addr - BUDDY_BASE) / PAGE_SIZE;
+    return (addr - buddy_get_base()) / PAGE_SIZE;
 }
 
 /* ---- Logging ----------------------------------------------------------- */
@@ -91,8 +92,9 @@ void kmalloc_init(void)
         pools[i].free_list  = NULL;
     }
 
-    /* Mark all pages as "not owned by any pool" initially. */
-    for (unsigned long i = 0; i < TOTAL_PAGES; i++)
+    /* Mark all managed pages as "not owned by any pool" initially. */
+    unsigned long total = buddy_get_total_pages();
+    for (unsigned long i = 0; i < total; i++)
         page_pool_idx[i] = -1;
 
     uart_puts("[kmalloc] Initialized: ");

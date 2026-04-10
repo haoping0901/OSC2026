@@ -6,8 +6,9 @@
 
 /* ===== Frame Array ======================================================
  *
- *   frame_array[i] >= 0           : head of a free block of order val
+ *   frame_array[i] >= 0             : head of a free block of order val
  *   frame_array[i] == FRAME_FREE_PART (-1) : free, part of a larger block
+ *   frame_array[i] == FRAME_RESERVED  (-2) : reserved, never allocatable
  *   frame_array[i] == ALLOC_TAG(idx, order): allocated
  *
  * For free block heads we embed a struct list_head at the start of the
@@ -19,7 +20,12 @@
 #define GET_ALLOC_ORDER(val)     ( (val) & 0xFF )
 #define GET_ALLOC_IDX(val)       ( ((val) >> 8) & 0x3FFFFF )
 
-static int frame_array[TOTAL_PAGES];
+/* Physical memory region managed by this allocator (set at runtime). */
+static uintptr_t      g_buddy_base;
+static uintptr_t      g_buddy_end;
+static unsigned long  g_total_pages;
+
+static int frame_array[MAX_PAGES];   /* ~2 MiB in BSS; sized for 2 GiB RAM */
 
 /* One free-list head per order (0 .. MAX_ORDER). */
 static struct list_head free_list[MAX_ORDER + 1];
@@ -29,13 +35,13 @@ static struct list_head free_list[MAX_ORDER + 1];
 /** Convert a frame index to the physical address it represents. */
 static inline uintptr_t idx_to_addr(unsigned long idx)
 {
-    return BUDDY_BASE + idx * PAGE_SIZE;
+    return g_buddy_base + idx * PAGE_SIZE;
 }
 
 /** Convert a physical address back to a frame index. */
 static inline unsigned long addr_to_idx(uintptr_t addr)
 {
-    return (addr - BUDDY_BASE) / PAGE_SIZE;
+    return (addr - g_buddy_base) / PAGE_SIZE;
 }
 
 /**
@@ -161,42 +167,117 @@ static void block_pop(unsigned long idx, int order)
 
 /* ===== Public API ======================================================= */
 
-void buddy_init(void)
+void buddy_init(uintptr_t base, uintptr_t size)
 {
+    g_buddy_base  = base;
+    g_buddy_end   = base + size;
+    g_total_pages = size / PAGE_SIZE;
+
+    /* Cap to the static array size. */
+    if (g_total_pages > MAX_PAGES)
+        g_total_pages = MAX_PAGES;
+
     /* Initialize all free list heads. */
     for (int i = 0; i <= MAX_ORDER; i++)
         INIT_LIST_HEAD(&free_list[i]);
 
-    /* All frames start as FRAME_FREE_PART (will be overwritten for heads). */
-    for (unsigned long i = 0; i < TOTAL_PAGES; i++)
+    /* Mark every frame as free-part; free lists will be built later,
+     * after all buddy_reserve() calls are done. */
+    for (unsigned long i = 0; i < g_total_pages; i++)
         frame_array[i] = FRAME_FREE_PART;
 
-    /*
-     * Build the initial free blocks.
-     * Walk through the range and create the largest possible aligned blocks.
-     */
+    uart_puts("[Buddy] Init: base=0x");
+    print_hex_ulong(base);
+    uart_puts(" pages=");
+    print_dec_ulong(g_total_pages);
+    uart_puts("\n");
+}
+
+void buddy_reserve(uintptr_t start, uintptr_t end)
+{
+    /* Round start down and end up to page boundaries. */
+    start = start & ~(PAGE_SIZE - 1UL);
+    end   = (end + PAGE_SIZE - 1UL) & ~(PAGE_SIZE - 1UL);
+
+    /* Clamp to the managed region. */
+    if (start < g_buddy_base)
+        start = g_buddy_base;
+    if (end   > g_buddy_end)
+        end = g_buddy_end;
+    if (start >= end)
+        return;
+
+    unsigned long first = addr_to_idx(start);
+    unsigned long last  = addr_to_idx(end);   /* exclusive */
+
+    for (unsigned long i = first; i < last; i++)
+        frame_array[i] = FRAME_RESERVED;
+
+    uart_puts("[Reserve] 0x");
+    print_hex_ulong(start);
+    uart_puts(" - 0x");
+    print_hex_ulong(end);
+    uart_puts("\n");
+}
+
+uintptr_t buddy_get_base(void)
+{
+    return g_buddy_base;
+}
+
+unsigned long buddy_get_total_pages(void)
+{
+    return g_total_pages;
+}
+
+void buddy_build_free_lists(void)
+{
     unsigned long idx = 0;
-    while (idx < TOTAL_PAGES) {
-        /* Find the largest order that:
-         *   1) is aligned  (idx % (1 << order) == 0)
-         *   2) fits        (idx + (1 << order) <= TOTAL_PAGES)
-         *   3) <= MAX_ORDER
+    while (idx < g_total_pages) {
+        /* Skip reserved pages one by one. */
+        if (frame_array[idx] == FRAME_RESERVED) {
+            idx++;
+            continue;
+        }
+
+        /*
+         * Find the largest order block that:
+         *   1) is aligned         (idx % (1 << order) == 0)
+         *   2) fits within range  (idx + (1 << order) <= g_total_pages)
+         *   3) contains no RESERVED pages
+         *   4) <= MAX_ORDER
          */
         int order = MAX_ORDER;
         while (order > 0) {
-            unsigned long block_pages = 1UL << order;
-            if ((idx & (block_pages - 1)) == 0 && idx + block_pages <= TOTAL_PAGES)
+            unsigned long block = 1UL << order;
+
+            /* Alignment and range check. */
+            if ((idx & (block - 1)) != 0 || idx + block > g_total_pages) {
+                order--;
+                continue;
+            }
+
+            /* Ensure no reserved page inside this block. */
+            int clean = 1;
+            for (unsigned long k = 0; k < block; k++) {
+                if (frame_array[idx + k] == FRAME_RESERVED) {
+                    clean = 0;
+                    break;
+                }
+            }
+            if (clean)
                 break;
             order--;
         }
+
         block_push(idx, order);
         idx += (1UL << order);
     }
 
-    uart_puts("[Buddy] Initialized: ");
-    print_dec_ulong(TOTAL_PAGES);
+    uart_puts("[Buddy] Free lists built: ");
+    print_dec_ulong(g_total_pages);
     uart_puts(" pages (");
-    print_dec_ulong(TOTAL_PAGES * PAGE_SIZE / 1024 / 1024);
+    print_dec_ulong(g_total_pages * PAGE_SIZE / 1024 / 1024);
     uart_puts(" MiB) managed\n");
 }
 
@@ -249,10 +330,14 @@ void buddy_free(void *ptr)
         return;
 
     uintptr_t addr = (uintptr_t)ptr;
-    if (addr < BUDDY_BASE || addr >= BUDDY_END)
+    if (addr < g_buddy_base || addr >= g_buddy_end)
         return;
 
     unsigned long idx = addr_to_idx(addr);
+
+    /* Guard against freeing a reserved page. */
+    if (frame_array[idx] == FRAME_RESERVED)
+        return;
 
     /* Extract the order of the originally allocated block from the tag */
     int order = GET_ALLOC_ORDER(frame_array[idx]);
@@ -269,7 +354,11 @@ void buddy_free(void *ptr)
         unsigned long buddy_idx = cur_idx ^ (1UL << cur_order);
 
         /* Buddy must be within range. */
-        if (buddy_idx >= TOTAL_PAGES)
+        if (buddy_idx >= g_total_pages)
+            break;
+
+        /* Buddy must not be reserved. */
+        if (frame_array[buddy_idx] == FRAME_RESERVED)
             break;
 
         /* Buddy must be a free block head of the same order. */

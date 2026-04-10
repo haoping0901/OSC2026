@@ -4,6 +4,20 @@
 #include "types.h"
 #include "buddy.h"
 #include "kmalloc.h"
+#include "utils.h"
+
+/* Kernel image boundaries exported by the linker script. */
+extern char _kernel_start[];
+extern char _kernel_end[];
+
+/*
+ * Adapter: dtb_walk_reserved_memory provides (base, size) but
+ * buddy_reserve takes (start, end).
+ */
+static void reserve_dtb_region(uintptr_t base, uintptr_t size)
+{
+    buddy_reserve(base, base + size);
+}
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
@@ -19,20 +33,73 @@ int main(unsigned long hart_id, void *dtb_ptr)
      * handles the "@<unit-addr>" suffix transparently.
      */
     uintptr_t u_base = dtb_getprop("/soc/serial", "reg");
-
-    /* Step 3: Override the UART driver's base address before first use. */
     uart_set_base(u_base);
 
-    /* Step 4: Announce the resolved address (sanity check). */
     uart_puts("Welcome to OPI-RV2!\n");
+    uart_puts("Uart base address: 0x");
+    print_hex_ulong(u_base);
+    uart_puts("\n");
 
-    /* Step 5: Initialize the buddy page-frame allocator. */
-    buddy_init();
+    /* Step 3: Retrieve the first usable memory region from the DTB
+     * <memory> node instead of using hardcoded addresses. */
+    uintptr_t mem_base = 0;
+    uintptr_t mem_size = 0;
+    if (dtb_get_memory_region(&mem_base, &mem_size) != 0) {
+        uart_puts("[FATAL] Cannot find memory node in DTB\n");
+        return -1;
+    }
+    uart_puts("[Mem] base=0x");
+    print_hex_ulong(mem_base);
+    uart_puts(" size=0x");
+    print_hex_ulong(mem_size);
+    uart_puts("\n");
 
-    /* Step 6: Initialize the dynamic memory allocator (chunk pools). */
+    /* Step 4: Initialize the buddy allocator over the entire region.
+     * Free lists are NOT built yet — we mark reservations first. */
+    buddy_init(mem_base, mem_size);
+
+    /* Step 5: Reserve all four categories of critical memory regions. */
+
+    /* 5-a: DTB blob itself */
+    uintptr_t dtb_size = dtb_get_totalsize();
+    uart_puts("[DTB] Address: 0x");
+    print_hex_ulong((uintptr_t)dtb_ptr);
+    uart_puts(" Size: 0x");
+    print_hex_ulong(dtb_size);
+    uart_puts("\n");
+    buddy_reserve((uintptr_t)dtb_ptr, (uintptr_t)dtb_ptr + dtb_size);
+
+    /* 5-b: Kernel image (text + rodata + data + bss + stack) */
+    uart_puts("[Kernel] Address: 0x");
+    print_hex_ulong((uintptr_t)_kernel_start);
+    uart_puts(" - 0x");
+    print_hex_ulong((uintptr_t)_kernel_end);
+    uart_puts("\n");
+    buddy_reserve((uintptr_t)_kernel_start, (uintptr_t)_kernel_end);
+
+    /* 5-c: Initramfs — present only when a bootloader passes it via /chosen */
+    uintptr_t initrd_start = dtb_getprop("/chosen", "linux,initrd-start");
+    uintptr_t initrd_end   = dtb_getprop("/chosen", "linux,initrd-end");
+    if (initrd_start != 0 && initrd_end > initrd_start) {
+        uart_puts("[Initrd] Address: 0x");
+        print_hex_ulong(initrd_start);
+        uart_puts(" - 0x");
+        print_hex_ulong(initrd_end);
+        uart_puts("\n");
+        buddy_reserve(initrd_start, initrd_end);
+    }
+
+    /* 5-d: Platform-specific regions from /reserved-memory node */
+    uart_puts("[DTB] Walking /reserved-memory regions...\n");
+    dtb_walk_reserved_memory(reserve_dtb_region);
+
+    /* Step 6: Build free lists — skips all RESERVED pages. */
+    buddy_build_free_lists();
+
+    /* Step 7: Initialize the dynamic memory allocator (chunk pools). */
     kmalloc_init();
 
-    /* Step 7: Continue with the interactive shell. */
+    /* Step 8: Continue with the interactive shell. */
     shell();
 
     return 0;

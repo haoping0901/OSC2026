@@ -34,18 +34,27 @@ static void test_alloc_1(void)
     uart_puts("Testing memory allocation...\n");
 
     /* Page-level allocations (> MAX_CHUNK_SIZE → buddy) */
+    uart_puts("Allocating 4000 bytes...\n");
     char *ptr1 = (char *)kmalloc(4000);
+    uart_puts("Allocating 8000 bytes...\n");
     char *ptr2 = (char *)kmalloc(8000);
+    uart_puts("Allocating another 4000 bytes...\n");
     char *ptr3 = (char *)kmalloc(4000);
+    uart_puts("Allocating 4000 bytes again...\n");
     char *ptr4 = (char *)kmalloc(4000);
 
+    uart_puts("Freeing the 4000-byte block...\n");
     kfree(ptr1);
+    uart_puts("Freeing the 8000-byte block...\n");
     kfree(ptr2);
+    uart_puts("Freeing the last two 4000-byte blocks...\n");
     kfree(ptr3);
+    uart_puts("Freeing the last 4000-byte block...\n");
     kfree(ptr4);
 
     /* Chunk-level allocations */
     uart_puts("Testing dynamic allocator...\n");
+    uart_puts("Allocating chunks of sizes 16, 32, 64, 128, 16, 32 bytes...\n");
     char *kmem_ptr1 = (char *)kmalloc(16);
     char *kmem_ptr2 = (char *)kmalloc(32);
     char *kmem_ptr3 = (char *)kmalloc(64);
@@ -53,6 +62,7 @@ static void test_alloc_1(void)
     char *kmem_ptr5 = (char *)kmalloc(16);
     char *kmem_ptr6 = (char *)kmalloc(32);
 
+    uart_puts("Freeing the 6 allocated chunks...\n");
     kfree(kmem_ptr1);
     kfree(kmem_ptr2);
     kfree(kmem_ptr3);
@@ -61,6 +71,7 @@ static void test_alloc_1(void)
     kfree(kmem_ptr6);
 
     /* Test allocate new page if the cache is not enough */
+    uart_puts("Testing chunk pool refill...\n");
     void *kmem_ptr[102];
     for (int i = 0; i < 100; i++) {
         kmem_ptr[i] = (char *)kmalloc(128);
@@ -70,7 +81,8 @@ static void test_alloc_1(void)
     }
 
     /* Test exceeding the maximum size */
-    char *kmem_ptr7 = (char *)kmalloc(TOTAL_PAGES * PAGE_SIZE + 1);
+    uart_puts("Testing allocation exceeding maximum size...\n");
+    char *kmem_ptr7 = (char *)kmalloc(buddy_get_total_pages() * PAGE_SIZE + 1);
     if (kmem_ptr7 == NULL) {
         uart_puts("Allocation failed as expected for size > MAX_ALLOC_SIZE\n");
     } else {
