@@ -3,6 +3,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = KERNEL_BASE;
+    _kernel_start = .;
 
     /* Output section */
     .text : {
@@ -31,4 +32,5 @@ SECTIONS
 
     . = ALIGN(16);
     _stack_top = . + 0x1000; /* reserve 4KB for stack */
+    _kernel_end = _stack_top;
 }

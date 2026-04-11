@@ -20,6 +20,10 @@ sudo apt update && sudo apt install qemu-system-riscv64 opensbi u-boot-qemu
 sudo apt update && sudo apt install u-boot-tools
 ```
 
+## VSCode Extension
+
+推薦使用 TraceNotes 擴充套件紀錄程式邏輯。
+
 ## FAQ
 
 ### Lab1: 要如何確認 QEMU 的 UART base address 以及 register layout?
@@ -27,19 +31,19 @@ sudo apt update && sudo apt install u-boot-tools
 1. 確認 QEMU 啟動時使用的 device tree。
 
 ```bash
-qemu-system-riscv64 -machine virt,dumpdtb=virt.dtb
+qemu-system-riscv64 -machine virt,dumpdtb=virt.dtb -m 8G
 ```
 
 2. 將取得的 dtb 檔轉為人類可讀的格式後，確認 serial node 的 `compatible` 屬性內容，以確定 QEMU 模擬的 UART 行為與哪個晶片相容，再去確認該晶片的 datasheet 來確認 register layout。
 
 ```bash
-dtc -I dtb -O dts virt.dtb > qemu_dtb.txt
+dtc -I dtb -O dts -o virt.dts virt.dtb
 ```
 
 3. 根據 `compatible` 屬性可知，QEMU UART driver 與 ns16550a 晶片相容，因此可透過 ns16550a 的 datasheet 來確認 register layout。
 
 ```C
-// qemu_dtb.txt
+// virt.dts
 ...
 		serial@10000000 {
 			interrupts = <0x0a>;
