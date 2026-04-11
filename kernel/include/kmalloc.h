@@ -16,9 +16,13 @@
 
 /**
  * Initialize the dynamic memory allocator.
- * Must be called once at boot, after buddy_init().
+ * Must be called once at boot, after buddy_build_free_lists().
+ *
+ * @ext_page_pool_idx: pointer to a signed char array of @page_count elements,
+ *                     allocated by buddy_startup_alloc()
+ * @page_count:        total number of page frames (buddy_get_total_pages())
  */
-void kmalloc_init(void);
+void kmalloc_init(signed char *ext_page_pool_idx, unsigned long page_count);
 
 /**
  * Allocate at least @size bytes of memory.

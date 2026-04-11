@@ -42,7 +42,7 @@ static pool_t pools[NUM_POOLS];
  * Value = pool index (0..NUM_POOLS-1) or -1 for large / buddy-only pages.
  * Sized for the maximum managed region (MAX_PAGES).
  */
-static signed char page_pool_idx[MAX_PAGES];
+static signed char *page_pool_idx; /* dynamically allocated by startup allocator */
 
 /* ---- Helpers ----------------------------------------------------------- */
 
@@ -84,8 +84,10 @@ static void log_chunk_free(uintptr_t addr, unsigned long chunk_size)
 
 /* ===== Public API ======================================================= */
 
-void kmalloc_init(void)
+void kmalloc_init(signed char *ext_page_pool_idx, unsigned long page_count)
 {
+    page_pool_idx = ext_page_pool_idx;
+
     /* Initialize pool metadata. */
     for (int i = 0; i < NUM_POOLS; i++) {
         pools[i].chunk_size = pool_sizes[i];
@@ -93,8 +95,7 @@ void kmalloc_init(void)
     }
 
     /* Mark all managed pages as "not owned by any pool" initially. */
-    unsigned long total = buddy_get_total_pages();
-    for (unsigned long i = 0; i < total; i++)
+    for (unsigned long i = 0; i < page_count; i++)
         page_pool_idx[i] = -1;
 
     uart_puts("[kmalloc] Initialized: ");

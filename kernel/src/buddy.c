@@ -25,7 +25,7 @@ static uintptr_t      g_buddy_base;
 static uintptr_t      g_buddy_end;
 static unsigned long  g_total_pages;
 
-static int frame_array[MAX_PAGES];   /* ~2 MiB in BSS; sized for 2 GiB RAM */
+static int *frame_array;             /* dynamically allocated by startup allocator */
 
 /* One free-list head per order (0 .. MAX_ORDER). */
 static struct list_head free_list[MAX_ORDER + 1];
@@ -167,15 +167,13 @@ static void block_pop(unsigned long idx, int order)
 
 /* ===== Public API ======================================================= */
 
-void buddy_init(uintptr_t base, uintptr_t size)
+void buddy_init(uintptr_t base, uintptr_t size,
+                int *ext_frame_array, unsigned long frame_count)
 {
     g_buddy_base  = base;
     g_buddy_end   = base + size;
-    g_total_pages = size / PAGE_SIZE;
-
-    /* Cap to the static array size. */
-    if (g_total_pages > MAX_PAGES)
-        g_total_pages = MAX_PAGES;
+    g_total_pages = frame_count;
+    frame_array   = ext_frame_array;
 
     /* Initialize all free list heads. */
     for (int i = 0; i <= MAX_ORDER; i++)
@@ -382,3 +380,165 @@ void buddy_free(void *ptr)
 
     log_free(addr, cur_order, cur_idx);
 }
+
+/* ===== Startup Allocator ==================================================
+ *
+ * Bump-style allocator used exclusively before buddy_init() is called.
+ * Its sole purpose is to allocate metadata arrays (frame_array,
+ * page_pool_idx) from the first usable gap in the physical memory region,
+ * skipping all reserved ranges registered via buddy_startup_reserve().
+ *
+ * Each successful allocation is appended to g_sa_reserves so that future
+ * allocations automatically skip already-used memory.  After buddy_init(),
+ * the caller must invoke buddy_startup_replay_reserves() to propagate all
+ * tracked regions (pre-registered reserves + metadata allocations) into
+ * the buddy system in one pass.
+ * ======================================================================== */
+
+static struct {
+    uintptr_t start;
+    uintptr_t end;
+} g_sa_reserves[BUDDY_STARTUP_MAX_RESERVES];
+static int       g_sa_reserve_count;
+
+static uintptr_t g_sa_mem_base;
+static uintptr_t g_sa_mem_end;
+
+
+/** Insertion-sort g_sa_reserves[] by start address (count is tiny). */
+static void sa_sort_reserves(void)
+{
+    for (int i = 1; i < g_sa_reserve_count; i++) {
+        uintptr_t ks = g_sa_reserves[i].start;
+        uintptr_t ke = g_sa_reserves[i].end;
+        int j = i - 1;
+        while (j >= 0 && g_sa_reserves[j].start > ks) {
+            g_sa_reserves[j + 1] = g_sa_reserves[j];
+            j--;
+        }
+        g_sa_reserves[j + 1].start = ks;
+        g_sa_reserves[j + 1].end   = ke;
+    }
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sa_find_first_free() – find the first 4 KiB-aligned free gap.
+ *
+ * Scans the managed memory region from g_sa_mem_base, advancing the
+ * cursor past every reserved region until a contiguous free window of
+ * at least @size bytes is found.
+ *
+ * @param size minimum byte length required (already page-aligned)
+ * @return start address of the gap, or 0 if none found
+ * -------------------------------------------------------------------- */
+static uintptr_t sa_find_first_free(unsigned long size)
+{
+    /* Always scan from the beginning of memory.  Previously allocated
+     * regions are recorded in g_sa_reserves, so they are naturally skipped
+     * along with the pre-registered reserved regions. */
+    uintptr_t cursor = g_sa_mem_base;
+
+    for (int i = 0; i <= g_sa_reserve_count; ++i) {
+        /* Upper bound of the current free window. */
+        uintptr_t window_end = (i < g_sa_reserve_count)
+                               ? g_sa_reserves[i].start
+                               : g_sa_mem_end;
+
+        /* Align cursor up to PAGE_SIZE. */
+        cursor = (cursor + PAGE_SIZE - 1UL) & ~(PAGE_SIZE - 1UL);
+
+        if (cursor + size <= window_end)
+            return cursor;
+
+        /* Advance past the next reserved region. */
+        if (i < g_sa_reserve_count)
+            cursor = g_sa_reserves[i].end;
+    }
+    return 0; /* no suitable gap found */
+}
+
+void buddy_startup_init(uintptr_t mem_base, uintptr_t mem_size)
+{
+    g_sa_mem_base      = mem_base;
+    g_sa_mem_end       = mem_base + mem_size;
+    g_sa_reserve_count = 0;
+
+    uart_puts("[Startup] Init: base=0x");
+    print_hex_ulong(mem_base);
+    uart_puts(" size=0x");
+    print_hex_ulong(mem_size);
+    uart_puts("\n");
+}
+
+void buddy_startup_reserve(uintptr_t start, uintptr_t end)
+{
+    if (g_sa_reserve_count >= BUDDY_STARTUP_MAX_RESERVES) {
+        uart_puts("[Startup] ERROR: too many reserves\n");
+        return;
+    }
+
+    /* Align to 4 KiB: round start down, round end up. */
+    start &= ~(PAGE_SIZE - 1UL);
+    end    = (end + PAGE_SIZE - 1UL) & ~(PAGE_SIZE - 1UL);
+
+    /* Clamp to managed region. */
+    if (start < g_sa_mem_base)
+        start = g_sa_mem_base;
+    if (end > g_sa_mem_end)
+        end = g_sa_mem_end;
+    if (start >= end)
+        return;
+
+    g_sa_reserves[g_sa_reserve_count].start = start;
+    g_sa_reserves[g_sa_reserve_count].end   = end;
+    g_sa_reserve_count++;
+
+    uart_puts("[Startup] Reserve 0x");
+    print_hex_ulong(start);
+    uart_puts(" - 0x");
+    print_hex_ulong(end);
+    uart_puts("\n");
+}
+
+void *buddy_startup_alloc(unsigned long size)
+{
+    /* Round size up to a PAGE_SIZE multiple. */
+    size = (size + PAGE_SIZE - 1UL) & ~(PAGE_SIZE - 1UL);
+
+    /* Re-sort every time: newly appended allocation records may be out of
+     * order relative to the pre-registered reserves. */
+    sa_sort_reserves();
+
+    /* Scan from mem_base every time.  Previously allocated regions have
+     * been appended to g_sa_reserves, so sa_find_first_free() skips them
+     * automatically and can therefore use gaps that appear before an
+     * earlier allocation. */
+    uintptr_t ret = sa_find_first_free(size);
+    if (ret == 0) {
+        uart_puts("[Startup] ERROR: no free region found\n");
+        return NULL;
+    }
+
+    /* Record this allocation as a reserved region so future calls skip it. */
+    g_sa_reserves[g_sa_reserve_count].start = ret;
+    g_sa_reserves[g_sa_reserve_count].end   = ret + size;
+    g_sa_reserve_count++;
+
+    uart_puts("[Startup] Alloc 0x");
+    print_hex_ulong(ret);
+    uart_puts(" size=0x");
+    print_hex_ulong(size);
+    uart_puts("\n");
+    return (void *)ret;
+}
+
+void buddy_startup_replay_reserves(void)
+{
+    uart_puts("[Startup] Replaying ");
+    print_dec_ulong((unsigned long)g_sa_reserve_count);
+    uart_puts(" reserve(s) into buddy\n");
+
+    for (int i = 0; i < g_sa_reserve_count; i++)
+        buddy_reserve(g_sa_reserves[i].start, g_sa_reserves[i].end);
+}
+

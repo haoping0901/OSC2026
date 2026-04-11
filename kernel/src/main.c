@@ -11,12 +11,12 @@ extern char _kernel_start[];
 extern char _kernel_end[];
 
 /*
- * Adapter: dtb_walk_reserved_memory provides (base, size) but
- * buddy_reserve takes (start, end).
+ * Adapter for dtb_walk_reserved_memory(): it provides (base, size) but
+ * buddy_startup_reserve() takes (start, end).
  */
-static void reserve_dtb_region(uintptr_t base, uintptr_t size)
+static void reserve_startup_region(uintptr_t base, uintptr_t size)
 {
-    buddy_reserve(base, base + size);
+    buddy_startup_reserve(base, base + size);
 }
 
 int main(unsigned long hart_id, void *dtb_ptr)
@@ -54,20 +54,21 @@ int main(unsigned long hart_id, void *dtb_ptr)
     print_hex_ulong(mem_size);
     uart_puts("\n");
 
-    /* Step 4: Initialize the buddy allocator over the entire region.
-     * Free lists are NOT built yet — we mark reservations first. */
-    buddy_init(mem_base, mem_size);
+    /* Step 4: Initialize the startup (bump) allocator.  It lives inside
+     * buddy.c and allocates metadata before the buddy system is ready. */
+    buddy_startup_init(mem_base, mem_size);
 
-    /* Step 5: Reserve all four categories of critical memory regions. */
+    /* Step 5: Register all reserved regions with the startup allocator so
+     * that buddy_startup_alloc() will not place metadata on top of them. */
 
-    /* 5-a: DTB blob itself */
+    /* 5-a: DTB blob */
     uintptr_t dtb_size = dtb_get_totalsize();
     uart_puts("[DTB] Address: 0x");
     print_hex_ulong((uintptr_t)dtb_ptr);
     uart_puts(" Size: 0x");
     print_hex_ulong(dtb_size);
     uart_puts("\n");
-    buddy_reserve((uintptr_t)dtb_ptr, (uintptr_t)dtb_ptr + dtb_size);
+    buddy_startup_reserve((uintptr_t)dtb_ptr, (uintptr_t)dtb_ptr + dtb_size);
 
     /* 5-b: Kernel image (text + rodata + data + bss + stack) */
     uart_puts("[Kernel] Address: 0x");
@@ -75,7 +76,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
     uart_puts(" - 0x");
     print_hex_ulong((uintptr_t)_kernel_end);
     uart_puts("\n");
-    buddy_reserve((uintptr_t)_kernel_start, (uintptr_t)_kernel_end);
+    buddy_startup_reserve((uintptr_t)_kernel_start, (uintptr_t)_kernel_end);
 
     /* 5-c: Initramfs — present only when a bootloader passes it via /chosen */
     uintptr_t initrd_start = dtb_getprop("/chosen", "linux,initrd-start");
@@ -86,20 +87,43 @@ int main(unsigned long hart_id, void *dtb_ptr)
         uart_puts(" - 0x");
         print_hex_ulong(initrd_end);
         uart_puts("\n");
-        buddy_reserve(initrd_start, initrd_end);
+        buddy_startup_reserve(initrd_start, initrd_end);
     }
 
     /* 5-d: Platform-specific regions from /reserved-memory node */
     uart_puts("[DTB] Walking /reserved-memory regions...\n");
-    dtb_walk_reserved_memory(reserve_dtb_region);
+    dtb_walk_reserved_memory(reserve_startup_region);
 
-    /* Step 6: Build free lists — skips all RESERVED pages. */
+    /* Step 6: Allocate metadata arrays via the startup allocator. */
+    unsigned long total_pages    = mem_size / PAGE_SIZE;
+    unsigned long fa_bytes       = total_pages * sizeof(int);
+    unsigned long ppi_bytes      = total_pages * sizeof(signed char);
+
+    uart_puts("[Startup] Allocating frame array (");
+    print_dec_ulong(fa_bytes);
+    uart_puts(" bytes)...\n");
+    int         *frame_array    = (int *)buddy_startup_alloc(fa_bytes);
+    uart_puts("[Startup] Allocating page pool index (");
+    print_dec_ulong(ppi_bytes);
+    uart_puts(" bytes)...\n");
+    signed char *page_pool_idx  = (signed char *)buddy_startup_alloc(ppi_bytes);
+
+    /* Step 7: Initialize the buddy allocator with the dynamically
+     * allocated frame array.  Free lists are NOT built yet. */
+    buddy_init(mem_base, mem_size, frame_array, total_pages);
+
+    /* Step 8: Replay all regions that were registered with the startup
+     * allocator (reserved regions + metadata allocations) into the buddy
+     * system in one pass, avoiding a second traversal of the DTB. */
+    buddy_startup_replay_reserves();
+
+    /* Step 9: Build free lists — skips all RESERVED pages. */
     buddy_build_free_lists();
 
-    /* Step 7: Initialize the dynamic memory allocator (chunk pools). */
-    kmalloc_init();
+    /* Step 10: Initialize the dynamic memory allocator (chunk pools). */
+    kmalloc_init(page_pool_idx, total_pages);
 
-    /* Step 8: Continue with the interactive shell. */
+    /* Step 11: Continue with the interactive shell. */
     shell();
 
     return 0;
