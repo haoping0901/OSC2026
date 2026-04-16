@@ -141,3 +141,55 @@ int cpio_cat(const void *archive, const char *target_filename)
 
     return -1;
 }
+
+/** ----------------------------------------------------------------------
+ * @brief cpio_find() – Locate a file inside an SVR4 newc cpio archive.
+ *
+ * Mirrors cpio_cat()'s traversal logic but, instead of printing, returns
+ * a pointer to the payload and its size via out-parameters. The caller
+ * is responsible for copying the bytes out before the archive is freed
+ * or overwritten.
+ * @param archive Base of the cpio blob.
+ * @param target  NUL-terminated filename to look up.
+ * @param data    Out: pointer to payload bytes inside the archive.
+ * @param size    Out: payload size in bytes.
+ * @return 0 on success, -1 otherwise.
+ * -------------------------------------------------------------------- */
+int cpio_find(const void *archive, const char *target,
+              const void **data, unsigned long *size)
+{
+    if (!archive || !target || !data || !size) {
+        return -1;
+    }
+
+    const char *ptr = (const char *)archive;
+    while (1) {
+        const struct cpio_newc_header *hdr = (const struct cpio_newc_header *)ptr;
+
+        if (hdr->c_magic[0] != '0' || hdr->c_magic[1] != '7' ||
+            hdr->c_magic[2] != '0' || hdr->c_magic[3] != '7' ||
+            hdr->c_magic[4] != '0' || hdr->c_magic[5] != '1') {
+            return -1;
+        }
+
+        unsigned long namesize = hex2int(hdr->c_namesize, 8);
+        unsigned long filesize = hex2int(hdr->c_filesize, 8);
+
+        const char *filename = ptr + sizeof(struct cpio_newc_header);
+
+        if (str_eq(filename, "TRAILER!!!")) {
+            return -1;
+        }
+
+        unsigned long file_data = align_4((unsigned long)filename + namesize);
+
+        if (str_eq(filename, target)) {
+            *data = (const void *)file_data;
+            *size = filesize;
+            return 0;
+        }
+
+        unsigned long next_hdr = align_4(file_data + filesize);
+        ptr = (const char *)next_hdr;
+    }
+}

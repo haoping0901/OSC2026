@@ -4,6 +4,7 @@
 #include "types.h"
 #include "buddy.h"
 #include "kmalloc.h"
+#include "trap.h"
 #include "utils.h"
 
 /* Kernel image boundaries exported by the linker script. */
@@ -99,13 +100,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
     unsigned long fa_bytes       = total_pages * sizeof(int);
     unsigned long ppi_bytes      = total_pages * sizeof(signed char);
 
-    uart_puts("[Startup] Allocating frame array (");
-    print_dec_ulong(fa_bytes);
-    uart_puts(" bytes)...\n");
     int         *frame_array    = (int *)buddy_startup_alloc(fa_bytes);
-    uart_puts("[Startup] Allocating page pool index (");
-    print_dec_ulong(ppi_bytes);
-    uart_puts(" bytes)...\n");
     signed char *page_pool_idx  = (signed char *)buddy_startup_alloc(ppi_bytes);
 
     /* Step 7: Initialize the buddy allocator with the dynamically
@@ -123,7 +118,12 @@ int main(unsigned long hart_id, void *dtb_ptr)
     /* Step 10: Initialize the dynamic memory allocator (chunk pools). */
     kmalloc_init(page_pool_idx, total_pages);
 
-    /* Step 11: Continue with the interactive shell. */
+    /* Step 11: Install the S-mode trap vector before any user program
+     * can execute ecall or hit an exception. */
+    trap_init();
+    uart_puts("[Trap] stvec installed.\n");
+
+    /* Step 12: Continue with the interactive shell. */
     shell();
 
     return 0;

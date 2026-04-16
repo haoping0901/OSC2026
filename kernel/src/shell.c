@@ -5,7 +5,10 @@
 #include "cpio.h"
 #include "buddy.h"
 #include "kmalloc.h"
+#include "trap.h"
 #include "types.h"
+
+#define USER_STACK_SIZE  (16 * 1024)  /* 16 KiB user stack for prog.bin */
 
 #define SHELL_BUF_SIZE 128
 
@@ -24,7 +27,59 @@ static void shell_print_help(void)
     uart_puts("  load  - receive kernel over UART and boot.\n");
     uart_puts("  ls    - list files in the initial ramdisk.\n");
     uart_puts("  cat   - print content of a file in the initial ramdisk.\n");
+    uart_puts("  exec  - load a user program from initrd and run it in U-mode.\n");
     uart_puts("  test  - run memory allocator test.\n");
+}
+
+/** ----------------------------------------------------------------------
+ * @brief run_user_program() – Load a file from initrd and drop into U-mode.
+ *
+ * Looks up @name inside the cpio archive, copies it into a fresh kmalloc
+ * region sized for both the code and a 16 KiB user stack, then calls
+ * enter_user_mode() which does not return. The shell regains control only
+ * through a trap (printed by trap_handler) followed by sret back to the
+ * program.
+ * @param name Filename inside the initial ramdisk (e.g. "prog.bin").
+ * -------------------------------------------------------------------- */
+static void run_user_program(const char *name)
+{
+    const void *initrd = (const void *)dtb_getprop("/chosen",
+                                                   "linux,initrd-start");
+    if (!initrd) {
+        uart_puts("exec: initrd not found\n");
+        return;
+    }
+
+    const void *src = NULL;
+    unsigned long src_size = 0;
+    if (cpio_find(initrd, name, &src, &src_size) != 0) {
+        uart_puts("exec: ");
+        uart_puts(name);
+        uart_puts(": not found\n");
+        return;
+    }
+
+    unsigned long total = src_size + USER_STACK_SIZE;
+    void *buf = kmalloc(total);
+    if (!buf) {
+        uart_puts("exec: out of memory\n");
+        return;
+    }
+    mem_cpy(buf, src, src_size);
+
+    uintptr_t entry   = (uintptr_t)buf;
+    uintptr_t user_sp = ((uintptr_t)buf + total) & ~0xfUL;
+
+    uart_puts("[exec] entry=0x");
+    print_hex_ulong(entry);
+    uart_puts(" sp=0x");
+    print_hex_ulong(user_sp);
+    uart_puts(" size=");
+    print_dec_ulong(src_size);
+    uart_puts("\n");
+
+    trap_set_user_base(entry);
+    enter_user_mode(entry, user_sp);
 }
 
 /* ---------- Lab 3 test case --------------------------------------------- */
@@ -177,12 +232,9 @@ static void shell_handle_command(const char *cmd)
         shell_print_info();
     } else if (str_eq(cmd, "load") != 0) {
         shell_load_kernel();
-    }
-    else if (str_eq(cmd, "test") != 0) {
+    } else if (str_eq(cmd, "test") != 0) {
         test_alloc_1();
-    }
-    else if (str_eq(cmd, "ls") != 0)
-    {
+    } else if (str_eq(cmd, "ls") != 0) {
         cpio_ls((void *)dtb_getprop("/chosen", "linux,initrd-start"));
     } else if (str_startswith(cmd, "cat ")) {
         const char *filename = cmd + 4;
@@ -197,6 +249,18 @@ static void shell_handle_command(const char *cmd)
         }
     } else if (str_eq(cmd, "cat") != 0) {
         uart_puts("usage: cat <filename>\n");
+    } else if (str_startswith(cmd, "exec ")) {
+        const char *name = cmd + 5;
+        while (*name == ' ') {
+            name++;
+        }
+        if (*name == '\0') {
+            uart_puts("usage: exec <filename>\n");
+        } else {
+            run_user_program(name);
+        }
+    } else if (str_eq(cmd, "exec") != 0) {
+        uart_puts("usage: exec <filename>\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);
