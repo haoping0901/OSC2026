@@ -126,15 +126,106 @@ trap_entry:
 
 .Lfrom_kernel:
     /*
-     * Trap occurred while the kernel was already running.
-     * Not expected for Basic Ex1; halt loudly so the developer sees it.
-     * sp is currently zero (swapped from sscratch); restore it from the
-     * stashed value and fall into a C panic routine.
+     * Trap taken while already in S-mode (sscratch was 0).
+     * After the csrrw at trap_entry, the original kernel sp sits in
+     * sscratch.  Swap it back so we can allocate a trap frame on the
+     * kernel stack and dispatch to trap_handler() normally.
      */
-    csrrw sp, sscratch, sp          /* restore sp, keep sscratch=0 */
-    call  kernel_trap_panic
-1:  wfi
-    j     1b
+    csrrw sp, sscratch, sp          /* sp = kernel sp, sscratch = 0 */
+
+    addi  sp, sp, -TF_SIZE
+
+    sd    x1,  TF_RA(sp)
+    /* x2 (sp) saved separately below. */
+    sd    x3,  TF_GP(sp)
+    sd    x4,  TF_TP(sp)
+    sd    x5,  TF_T0(sp)
+    sd    x6,  TF_T1(sp)
+    sd    x7,  TF_T2(sp)
+    sd    x8,  TF_S0(sp)
+    sd    x9,  TF_S1(sp)
+    sd    x10, TF_A0(sp)
+    sd    x11, TF_A1(sp)
+    sd    x12, TF_A2(sp)
+    sd    x13, TF_A3(sp)
+    sd    x14, TF_A4(sp)
+    sd    x15, TF_A5(sp)
+    sd    x16, TF_A6(sp)
+    sd    x17, TF_A7(sp)
+    sd    x18, TF_S2(sp)
+    sd    x19, TF_S3(sp)
+    sd    x20, TF_S4(sp)
+    sd    x21, TF_S5(sp)
+    sd    x22, TF_S6(sp)
+    sd    x23, TF_S7(sp)
+    sd    x24, TF_S8(sp)
+    sd    x25, TF_S9(sp)
+    sd    x26, TF_S10(sp)
+    sd    x27, TF_S11(sp)
+    sd    x28, TF_T3(sp)
+    sd    x29, TF_T4(sp)
+    sd    x30, TF_T5(sp)
+    sd    x31, TF_T6(sp)
+
+    /* Save the original kernel sp (before frame allocation). */
+    addi  t0, sp, TF_SIZE
+    sd    t0, TF_SP(sp)
+
+    /* Save supervisor CSRs. */
+    csrr  t0, sepc
+    csrr  t1, sstatus
+    csrr  t2, scause
+    csrr  t3, stval
+    sd    t0, TF_SEPC(sp)
+    sd    t1, TF_SSTATUS(sp)
+    sd    t2, TF_SCAUSE(sp)
+    sd    t3, TF_STVAL(sp)
+
+    mv    a0, sp
+    call  trap_handler
+
+    /* Restore sepc and sstatus. */
+    ld    t0, TF_SEPC(sp)
+    ld    t1, TF_SSTATUS(sp)
+    csrw  sepc, t0
+    csrw  sstatus, t1
+
+    /* Restore GPRs. */
+    ld    x1,  TF_RA(sp)
+    ld    x3,  TF_GP(sp)
+    ld    x4,  TF_TP(sp)
+    ld    x5,  TF_T0(sp)
+    ld    x6,  TF_T1(sp)
+    ld    x7,  TF_T2(sp)
+    ld    x8,  TF_S0(sp)
+    ld    x9,  TF_S1(sp)
+    ld    x10, TF_A0(sp)
+    ld    x11, TF_A1(sp)
+    ld    x12, TF_A2(sp)
+    ld    x13, TF_A3(sp)
+    ld    x14, TF_A4(sp)
+    ld    x15, TF_A5(sp)
+    ld    x16, TF_A6(sp)
+    ld    x17, TF_A7(sp)
+    ld    x18, TF_S2(sp)
+    ld    x19, TF_S3(sp)
+    ld    x20, TF_S4(sp)
+    ld    x21, TF_S5(sp)
+    ld    x22, TF_S6(sp)
+    ld    x23, TF_S7(sp)
+    ld    x24, TF_S8(sp)
+    ld    x25, TF_S9(sp)
+    ld    x26, TF_S10(sp)
+    ld    x27, TF_S11(sp)
+    ld    x28, TF_T3(sp)
+    ld    x29, TF_T4(sp)
+    ld    x30, TF_T5(sp)
+    ld    x31, TF_T6(sp)
+
+    /* Deallocate the frame and return to S-mode.
+     * sscratch stays 0 (kernel-mode sentinel). */
+    addi  sp, sp, TF_SIZE
+    sret
 
 
 /* ------------------------------------------------------------------ */

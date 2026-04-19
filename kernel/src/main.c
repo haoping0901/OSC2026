@@ -5,6 +5,7 @@
 #include "buddy.h"
 #include "kmalloc.h"
 #include "trap.h"
+#include "timer.h"
 #include "utils.h"
 
 /* Kernel image boundaries exported by the linker script. */
@@ -123,7 +124,11 @@ int main(unsigned long hart_id, void *dtb_ptr)
     trap_init();
     uart_puts("[Trap] stvec installed.\n");
 
-    /* Step 12: Continue with the interactive shell. */
+    /* Step 12: Enable the core timer interrupt (Ex2). */
+    timer_init();
+    uart_puts("[Timer] Core timer interrupt enabled.\n");
+
+    /* Step 13: Continue with the interactive shell. */
     shell();
 
     return 0;

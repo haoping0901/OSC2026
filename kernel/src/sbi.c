@@ -44,3 +44,30 @@ struct sbiret sbi_get_impl_version(void)
                      0, 0, 0, 0, 0, 0);
 }
 
+/** ----------------------------------------------------------------------
+ * @brief sbi_set_timer() – Schedule the next S-mode timer interrupt.
+ *
+ * Attempts the SBI v0.2+ TIME extension (EID 0x54494D45) first.  When
+ * the firmware does not implement it – SpacemiT K1's OpenSBI, for
+ * example, returns SBI_ERR_NOT_SUPPORTED – the call is retried using
+ * the SBI v0.1 legacy SET_TIMER ecall (EID 0x0), which every OpenSBI
+ * build is expected to keep around for backward compatibility.
+ * @param stime_value Absolute mtime value at which the next S-timer
+ *                    interrupt should fire.
+ * @return sbiret of whichever call actually took effect.  On success
+ *         .error == 0.  When both paths fail, the legacy call's
+ *         sbiret is propagated so the caller can inspect .error.
+ * -------------------------------------------------------------------- */
+struct sbiret sbi_set_timer(unsigned long long stime_value)
+{
+	struct sbiret r = sbi_ecall(SBI_EXT_TIME, SBI_EXT_TIME_SET_TIMER,
+	                            stime_value, 0, 0, 0, 0, 0);
+	if (r.error == 0)
+		return r;
+
+	/* Fallback: SBI v0.1 legacy set_timer.  FID is ignored; arg0
+	 * carries the full 64-bit mtime value on RV64. */
+	return sbi_ecall(SBI_EXT_LEGACY_SET_TIMER, 0,
+	                 stime_value, 0, 0, 0, 0, 0);
+}
+

@@ -1,5 +1,6 @@
 #include "trap.h"
 #include "riscv.h"
+#include "timer.h"
 #include "uart.h"
 #include "utils.h"
 #include "types.h"
@@ -49,8 +50,12 @@ void trap_handler(struct trap_frame *tf)
 {
     uintptr_t cause = tf->scause;
 
-    /* Ex1 does not enable any S-mode interrupts; ignore if one slips in. */
+    /* Interrupt: dispatch by interrupt cause code. */
     if (cause & SCAUSE_INTR_BIT) {
+        uintptr_t code = cause & ~SCAUSE_INTR_BIT;
+
+        if (code == INTR_S_TIMER)
+            timer_handle_interrupt();
         return;
     }
 
