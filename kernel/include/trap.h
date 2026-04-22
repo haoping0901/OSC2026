@@ -118,6 +118,16 @@ void trap_handler(struct trap_frame *tf);
 void trap_set_user_base(uintptr_t base);
 
 /** ----------------------------------------------------------------------
+ * @brief trap_set_uart_irq() – Register the UART0 IRQ id.
+ *
+ * Tells the trap dispatcher which PLIC IRQ id should be routed to the
+ * UART interrupt handler. Call this after DTB parsing and before
+ * enabling sie.SEIE.
+ * @param irq PLIC IRQ source id for UART0.
+ * -------------------------------------------------------------------- */
+void trap_set_uart_irq(unsigned int irq);
+
+/** ----------------------------------------------------------------------
  * @brief enter_user_mode() – Drop from S-mode into U-mode via sret.
  *
  * Stashes the current kernel sp into sscratch, programs sepc with the

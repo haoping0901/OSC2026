@@ -1,8 +1,14 @@
 #include "uart.h"
+#include "riscv.h"
 #include "types.h"
 
 /* Runtime UART base address – overridden by uart_set_base() after DTB parse */
 static volatile unsigned long g_uart_base;
+
+/* Flipped to 1 by uart_enable_irq_mode() once PLIC is wired up; until
+ * then uart_putc / uart_getc stay on the polled path so early banners and
+ * the first shell prompt work even before interrupts are online. */
+static volatile int g_uart_irq_mode;
 
 void uart_set_base(unsigned long base)
 {
@@ -20,6 +26,7 @@ void uart_set_base(unsigned long base)
 #define UART_IER    0x04
 #define UART_FCR    0x08
 #define UART_LCR    0x0C
+#define UART_MCR    0x10
 #define UART_LSR    0x14
 #else
 #define UART_RBR    0x00
@@ -27,8 +34,14 @@ void uart_set_base(unsigned long base)
 #define UART_IER    0x01
 #define UART_FCR    0x02
 #define UART_LCR    0x03
+#define UART_MCR    0x04
 #define UART_LSR    0x05
 #endif // !QEMU
+
+/* MCR.OUT2 gates the external IRQ line on 16550/PXA UARTs: without it
+ * asserted the IER may be set and events fire in LSR, but no IRQ ever
+ * reaches the PLIC. */
+#define MCR_OUT2        (1 << 3)
 
 /* IER bits */
 #define IER_RAVIE       (1 << 0)    /* Receiver Data Available Interrupt Enable  */
@@ -125,47 +138,132 @@ static inline unsigned int mmio_read(unsigned long addr)
 #endif // !QEMU 
 }
 
-#if 0
-static void uart_clk_enable(unsigned char fnclksel)
+/* -----------------------------------------------------------------------
+ * Ring buffers for IRQ-driven RX/TX.
+ *
+ * Single-producer / single-consumer: RX is produced by the ISR and
+ * consumed by uart_getc(); TX is produced by uart_putc() and drained
+ * by the ISR. head == tail ⇒ empty; (head + 1) mod N == tail ⇒ full.
+ * UART_BUF_SIZE must be a power of 2 so the modulo reduces to an AND.
+ * ----------------------------------------------------------------------- */
+#define UART_BUF_SIZE   256U
+#define UART_BUF_MASK   (UART_BUF_SIZE - 1U)
+
+struct uart_ring {
+    unsigned char buf[UART_BUF_SIZE];
+    volatile unsigned int head;
+    volatile unsigned int tail;
+};
+
+static struct uart_ring rx_buf;
+static struct uart_ring tx_buf;
+
+static inline int ring_empty(const struct uart_ring *r)
 {
-    unsigned long clk_rst_addr = APBCLK_BASE + 0x00;
-
-    /* 1. Assert reset first (RST=1, clocks off) */
-    mmio_write32(clk_rst_addr,
-                 CLK_RST_FNCLKSEL(fnclksel) | CLK_RST_RST);
-
-    /* 2. Enable APB bus clock and functional clock, keep reset asserted */
-    mmio_write32(clk_rst_addr,
-                 CLK_RST_FNCLKSEL(fnclksel) | CLK_RST_RST |
-                 CLK_RST_FNCLK | CLK_RST_APBCLK);
-
-    /* 3. De-assert reset (RST=0) */
-    mmio_write32(clk_rst_addr,
-                 CLK_RST_FNCLKSEL(fnclksel) |
-                 CLK_RST_FNCLK | CLK_RST_APBCLK);
+    return r->head == r->tail;
 }
 
+static inline int ring_full(const struct uart_ring *r)
+{
+    return ((r->head + 1U) & UART_BUF_MASK) == r->tail;
+}
+
+static inline void ring_push(struct uart_ring *r, unsigned char c)
+{
+    unsigned int next = (r->head + 1U) & UART_BUF_MASK;
+    if (next == r->tail)
+        return; /* Overflow: drop newest to keep producer wait-free. */
+    r->buf[r->head] = c;
+    r->head = next;
+}
+
+static inline int ring_pop(struct uart_ring *r)
+{
+    if (r->head == r->tail)
+        return -1;
+    unsigned char c = r->buf[r->tail];
+    r->tail = (r->tail + 1U) & UART_BUF_MASK;
+    return c;
+}
+
+static inline unsigned long sie_save_clear(void)
+{
+    unsigned long prev;
+    asm volatile ("csrrc %0, sstatus, %1"
+                  : "=r"(prev) : "r"((unsigned long)SSTATUS_SIE));
+    return prev & SSTATUS_SIE;
+}
+
+static inline void sie_restore(unsigned long bit)
+{
+    if (bit)
+        asm volatile ("csrs sstatus, %0" :: "r"(bit));
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uart_init() – Configure UART0 for interrupt-driven I/O.
+ *
+ * Enables and resets the RX/TX FIFOs, asserts MCR.OUT2 to route the
+ * UART IRQ line to the PLIC, and enables RX-available interrupts.
+ * TX interrupts (IER.TIE) remain off and are flipped on demand by
+ * uart_putc() when bytes are queued. Baud / line format are left
+ * untouched: U-Boot has already programmed them, and reprogramming
+ * would drop the host-side terminal.
+ * -------------------------------------------------------------------- */
 void uart_init(void)
 {
-    /* Enable clocks, de-assert reset (14.7456 MHz functional clock) */
-    uart_clk_enable(FNCLKSEL_14M7);
+    /* Gate the external IRQ line on via MCR.OUT2, preserving DTR/RTS
+     * that U-Boot asserted (some USB-UART bridges gate RX/TX on them).
+     * OUT2 is the switch that turns "IER events" into a wire toggle
+     * feeding the PLIC.                                               */
+    unsigned int mcr = mmio_read(UART_BASE + UART_MCR);
+    mmio_write(UART_BASE + UART_MCR, mcr | MCR_OUT2);
 
-    /* --- Program baud rate (DLAB=1) --- */
-    mmio_write32(UART_BASE + UART_LCR, LCR_DLAB);
-    mmio_write32(UART_BASE + UART_DLL, BAUD_DIV_115200 & 0xFF);
-    mmio_write32(UART_BASE + UART_DLH, (BAUD_DIV_115200 >> 8) & 0xFF);
-
-    /* --- Line format: 8N1 (DLAB=0) --- */
-    mmio_write32(UART_BASE + UART_LCR, LCR_WLS_8 | LCR_STB_1);
-
-    /* --- Enable and reset FIFOs (64-byte depth) --- */
-    mmio_write32(UART_BASE + UART_FCR,
-                 FCR_TRFIFOE | FCR_RESETRF | FCR_RESETTF | FCR_ITL_1);
-
-    /* --- Enable UART unit, no interrupt, no DMA --- */
-    mmio_write32(UART_BASE + UART_IER, IER_UUE);
+    /* Enable RX-data-available IRQ; keep TX IRQ off until uart_putc
+     * queues data. Preserve other IER bits U-Boot may rely on.       */
+    unsigned int ier = mmio_read(UART_BASE + UART_IER);
+    mmio_write(UART_BASE + UART_IER, (ier & ~IER_TIE) | IER_RAVIE);
 }
-#endif // 0
+
+/** ----------------------------------------------------------------------
+ * @brief uart_enable_irq_mode() – Switch getc/putc to ring-buffer path.
+ *
+ * Called from main() after plic_init() and sie.SEIE have been set.
+ * Before this flag flips, uart_putc()/uart_getc() stay on the polled
+ * path so that early boot output and any pre-PLIC prompts still work.
+ * -------------------------------------------------------------------- */
+void uart_enable_irq_mode(void)
+{
+    g_uart_irq_mode = 1;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uart_handle_interrupt() – UART ISR entry from trap dispatcher.
+ *
+ * Drains all pending RX bytes into rx_buf, then if TX FIFO has room
+ * pops from tx_buf into THR. Clears IER.TIE once tx_buf drains so the
+ * TX event stops re-asserting. Safe to call with a spurious claim —
+ * returns immediately when IIR reports "no interrupt".
+ * -------------------------------------------------------------------- */
+void uart_handle_interrupt(void)
+{
+    while (mmio_read(UART_BASE + UART_LSR) & LSR_DR) {
+        unsigned char ch = mmio_read(UART_BASE + UART_RBR) & 0xFF;
+        ring_push(&rx_buf, ch);
+    }
+
+    while (!ring_empty(&tx_buf) &&
+           (mmio_read(UART_BASE + UART_LSR) & LSR_TDRQ)) {
+        int c = ring_pop(&tx_buf);
+        mmio_write(UART_BASE + UART_THR, (unsigned char)c);
+    }
+
+    if (ring_empty(&tx_buf)) {
+        unsigned int ier = mmio_read(UART_BASE + UART_IER);
+        if (ier & IER_TIE)
+            mmio_write(UART_BASE + UART_IER, ier & ~IER_TIE);
+    }
+}
 
 /* -----------------------------------------------------------------------
  * uart_getc() – receive one byte (blocking poll)
@@ -175,20 +273,17 @@ void uart_init(void)
  * ----------------------------------------------------------------------- */
 int uart_getc(void)
 {
-    unsigned int lsr;
-    unsigned int ch;
+    int c;
 
-    /* Poll until a character is available in the RX FIFO */
-    do {
-        lsr = mmio_read(UART_BASE + UART_LSR);
-    } while (!(lsr & LSR_DR));
+    if (g_uart_irq_mode) {
+        while (ring_empty(&rx_buf))
+            asm volatile ("wfi");
+        c = ring_pop(&rx_buf);
+    } else {
+        c = uart_getc_raw();
+    }
 
-    /* Check for receive errors before reading */
-    if (lsr & (LSR_OE | LSR_PE | LSR_FE | LSR_BI))
-        return -1;
-
-    ch = mmio_read(UART_BASE + UART_RBR) & 0xFF;
-    return ch == '\r' ? '\n' : ch;
+    return c == '\r' ? '\n' : c;
 }
 
 int uart_getc_raw(void) {
@@ -216,7 +311,21 @@ void uart_putc(unsigned char c)
     if (c == '\n')
         uart_putc('\r');
 
-    /* Poll until TX FIFO has space (TDRQ=1 means <= half full) */
+    if (g_uart_irq_mode) {
+        /* Block (wfi) until the ISR has drained enough of tx_buf. */
+        while (ring_full(&tx_buf))
+            asm volatile ("wfi");
+
+        unsigned long sie = sie_save_clear();
+        ring_push(&tx_buf, c);
+        unsigned int ier = mmio_read(UART_BASE + UART_IER);
+        if (!(ier & IER_TIE))
+            mmio_write(UART_BASE + UART_IER, ier | IER_TIE);
+        sie_restore(sie);
+        return;
+    }
+
+    /* Pre-PLIC poll fallback. */
     while ((mmio_read(UART_BASE + UART_LSR) & LSR_TDRQ) == 0)
         ;
 

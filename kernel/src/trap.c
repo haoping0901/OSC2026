@@ -2,8 +2,17 @@
 #include "riscv.h"
 #include "timer.h"
 #include "uart.h"
+#include "plic.h"
 #include "utils.h"
 #include "types.h"
+
+/* UART0 IRQ id (from DTB). Set via trap_set_uart_irq() before SEIE. */
+static unsigned int g_uart_irq;
+
+void trap_set_uart_irq(unsigned int irq)
+{
+    g_uart_irq = irq;
+}
 
 _Static_assert(sizeof(struct trap_frame) == TF_SIZE,
                "struct trap_frame size must match TF_SIZE in trap.h");
@@ -54,8 +63,15 @@ void trap_handler(struct trap_frame *tf)
     if (cause & SCAUSE_INTR_BIT) {
         uintptr_t code = cause & ~SCAUSE_INTR_BIT;
 
-        if (code == INTR_S_TIMER)
+        if (code == INTR_S_TIMER) {
             timer_handle_interrupt();
+        } else if (code == INTR_S_EXT) {
+            unsigned int irq = plic_claim();
+            if (irq == g_uart_irq && irq != 0)
+                uart_handle_interrupt();
+            if (irq != 0)
+                plic_complete(irq);
+        }
         return;
     }
 
