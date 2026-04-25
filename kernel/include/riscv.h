@@ -35,4 +35,35 @@
 #define EXC_LOAD_PAGE_FAULT  13
 #define EXC_STORE_PAGE_FAULT 15
 
+/* ---------- S-mode interrupt critical-section helpers ------------------ */
+
+/** ----------------------------------------------------------------------
+ * @brief sie_save_clear() – Atomically clear sstatus.SIE, return old bit.
+ *
+ * Uses csrrc so the read-modify-write is a single instruction and cannot
+ * be split by a trap. The returned value is the previous SIE bit only
+ * (masked), suitable to be fed back to sie_restore().
+ * @return Previous sstatus.SIE bit (0 or SSTATUS_SIE).
+ * -------------------------------------------------------------------- */
+static inline unsigned long sie_save_clear(void)
+{
+    unsigned long prev;
+    asm volatile ("csrrc %0, sstatus, %1"
+                  : "=r"(prev) : "r"((unsigned long)SSTATUS_SIE));
+    return prev & SSTATUS_SIE;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sie_restore() – Re-assert sstatus.SIE iff it was previously set.
+ *
+ * Pair with sie_save_clear() to bracket a short critical section that
+ * must not be pre-empted by an S-mode interrupt.
+ * @param bit Value previously returned by sie_save_clear().
+ * -------------------------------------------------------------------- */
+static inline void sie_restore(unsigned long bit)
+{
+    if (bit)
+        asm volatile ("csrs sstatus, %0" :: "r"(bit));
+}
+
 #endif /* __RISCV_H__ */

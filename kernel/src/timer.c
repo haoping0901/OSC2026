@@ -5,20 +5,35 @@
 #include "uart.h"
 #include "utils.h"
 #include "types.h"
+#include "list.h"
+#include "kmalloc.h"
 
-#define TIMER_INTERVAL_SECS	2
-#define DEFAULT_TIMEBASE_FREQ	0x989680UL	/* QEMU virt fallback */
+#define DEFAULT_TIMEBASE_FREQ	0x989680UL	/* QEMU virt fallback: 10 MHz */
 
 static uint64_t g_timebase_freq;
-static uint64_t g_elapsed_secs;
+
+/*
+ * Timer queue sorted by ascending expire_tick.  g_timer_queue.next is
+ * always the earliest timer (= what the hardware timer is programmed
+ * for).  When the queue is empty the hardware timer is parked at
+ * (uint64_t)-1 so it never fires spontaneously.
+ */
+static struct list_head g_timer_queue = LIST_HEAD_INIT(g_timer_queue);
+
+struct timer_node {
+	struct list_head link;
+	uint64_t         expire_tick;
+	uint64_t         register_tick;
+	void           (*cb)(void *);
+	void            *arg;
+};
 
 /** ----------------------------------------------------------------------
- * @brief read_time() – Read the current timer value.
+ * @brief read_time() – Read the current value of the time CSR.
  *
- * Executes the rdtime pseudo-instruction to obtain the current
- * value of the time CSR.  This counter increments at the platform's
- * timebase frequency.
- * @return Current 64-bit timer value.
+ * Executes the rdtime pseudo-instruction. The counter increments at
+ * the platform's timebase-frequency regardless of privilege mode.
+ * @return Current 64-bit time CSR value.
  * -------------------------------------------------------------------- */
 static inline uint64_t read_time(void)
 {
@@ -29,12 +44,34 @@ static inline uint64_t read_time(void)
 }
 
 /** ----------------------------------------------------------------------
- * @brief timer_init() – Enable the core timer interrupt.
+ * @brief timer_get_timebase_freq() – Accessor for the DTB-probed freq.
  *
- * Reads the timebase frequency from the DTB /cpus node.  Falls
- * back to 10 MHz (QEMU virt default) when the property is absent.
- * Programs the first timer interrupt 2 seconds into the future,
- * then enables sie.STIE and sstatus.SIE so the interrupt can fire.
+ * Used by callers that need to translate tick deltas into seconds
+ * (e.g. the shell's setTimeout callback).
+ * @return Timebase frequency in Hz.
+ * -------------------------------------------------------------------- */
+uint64_t timer_get_timebase_freq(void)
+{
+	return g_timebase_freq;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief timer_read_ticks() – Expose the raw time CSR to other modules.
+ * @return Current 64-bit time CSR value.
+ * -------------------------------------------------------------------- */
+uint64_t timer_read_ticks(void)
+{
+	return read_time();
+}
+
+/** ----------------------------------------------------------------------
+ * @brief timer_init() – Enable the S-mode core timer interrupt.
+ *
+ * Probes timebase-frequency from the DTB /cpus node (fallback 10 MHz
+ * for QEMU virt), then enables sie.STIE and sstatus.SIE. The hardware
+ * timer is pushed to the distant future — with an empty queue there
+ * is nothing to fire yet, and add_timer() will reprogram it as soon
+ * as the first entry is registered.
  * -------------------------------------------------------------------- */
 void timer_init(void)
 {
@@ -42,10 +79,10 @@ void timer_init(void)
 	if (g_timebase_freq == 0)
 		g_timebase_freq = DEFAULT_TIMEBASE_FREQ;
 
-	/* Schedule the first timer interrupt. */
-	sbi_set_timer(read_time() + TIMER_INTERVAL_SECS * g_timebase_freq);
+	/* Park the hardware timer: no pending timers means no IRQ wanted. */
+	sbi_set_timer((uint64_t)-1);
 
-	/* Enable S-mode timer interrupt (per-source switch). */
+	/* Enable the per-source switch (sie.STIE). */
 	asm volatile ("csrs sie, %0" :: "r"((unsigned long)SIE_STIE));
 
 	/* Enable global S-mode interrupts. */
@@ -53,19 +90,80 @@ void timer_init(void)
 }
 
 /** ----------------------------------------------------------------------
- * @brief timer_handle_interrupt() – S-mode timer interrupt handler.
+ * @brief add_timer() – Register a one-shot callback after @sec seconds.
  *
- * Increments the elapsed-seconds counter by the timer interval,
- * prints the value, and reprograms the timer for the next period.
- * sbi_set_timer() implicitly clears sip.STIP per the SBI spec.
+ * Inserts the new node into the queue ordered by expire_tick. If the
+ * freshly inserted node becomes the earliest (queue head), the
+ * hardware timer is reprogrammed via sbi_set_timer(). The whole
+ * queue mutation runs with sstatus.SIE cleared to keep the timer IRQ
+ * handler from racing against the walker.
+ * @param callback Function to invoke in IRQ context on expiry.
+ * @param arg      Opaque pointer handed to the callback verbatim.
+ * @param sec      Delay in whole seconds.
+ * -------------------------------------------------------------------- */
+void add_timer(void (*callback)(void *), void *arg, int sec)
+{
+	struct timer_node *n = kmalloc(sizeof(*n));
+	if (!n)
+		return;
+
+	uint64_t now = read_time();
+	n->register_tick = now;
+	n->expire_tick   = now + (uint64_t)sec * g_timebase_freq;
+	n->cb            = callback;
+	n->arg           = arg;
+
+	unsigned long flags = sie_save_clear();
+
+	/* Walk until we find the first node that expires *after* us. */
+	struct list_head *p;
+	for (p = g_timer_queue.next; p != &g_timer_queue; p = p->next) {
+		struct timer_node *t = list_entry(p, struct timer_node, link);
+		if (n->expire_tick < t->expire_tick)
+			break;
+	}
+	/* Insert immediately before p (p may be the head sentinel). */
+	n->link.prev = p->prev;
+	n->link.next = p;
+	p->prev->next = &n->link;
+	p->prev = &n->link;
+
+	/* If we just became the earliest, reprogram the hardware timer. */
+	if (g_timer_queue.next == &n->link)
+		sbi_set_timer(n->expire_tick);
+
+	sie_restore(flags);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief timer_handle_interrupt() – Drain expired timers, rearm the HW.
+ *
+ * A single IRQ may cover multiple already-expired nodes when dispatch
+ * was delayed (e.g. shell held SIE cleared for a while), so this loop
+ * pops every node whose expire_tick has passed before rearming. If
+ * the queue empties, the hardware timer is parked at (uint64_t)-1.
+ * Callbacks are invoked in IRQ context and must be short.
  * -------------------------------------------------------------------- */
 void timer_handle_interrupt(void)
 {
-	g_elapsed_secs += TIMER_INTERVAL_SECS;
+	uint64_t now = read_time();
 
-	uart_puts("Seconds after booting: ");
-	print_dec_ulong(g_elapsed_secs);
-	uart_puts("\n");
+	while (!list_empty(&g_timer_queue)) {
+		struct timer_node *t = list_entry(g_timer_queue.next,
+		                                  struct timer_node, link);
+		if (t->expire_tick > now)
+			break;
 
-	sbi_set_timer(read_time() + TIMER_INTERVAL_SECS * g_timebase_freq);
+		list_del(&t->link);
+		t->cb(t->arg);
+		kfree(t);
+	}
+
+	if (!list_empty(&g_timer_queue)) {
+		struct timer_node *h = list_entry(g_timer_queue.next,
+		                                  struct timer_node, link);
+		sbi_set_timer(h->expire_tick);
+	} else {
+		sbi_set_timer((uint64_t)-1);
+	}
 }

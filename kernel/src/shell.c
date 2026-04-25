@@ -6,6 +6,7 @@
 #include "buddy.h"
 #include "kmalloc.h"
 #include "trap.h"
+#include "timer.h"
 #include "types.h"
 
 #define USER_STACK_SIZE  (16 * 1024)  /* 16 KiB user stack for prog.bin */
@@ -29,6 +30,99 @@ static void shell_print_help(void)
     uart_puts("  cat   - print content of a file in the initial ramdisk.\n");
     uart_puts("  exec  - load a user program from initrd and run it in U-mode.\n");
     uart_puts("  test  - run memory allocator test.\n");
+    uart_puts("  setTimeout <sec> <msg> - print msg after sec seconds.\n");
+}
+
+/* ---------- setTimeout (Advanced Ex1: timer multiplexing) --------------- */
+
+#define SETTO_MSG_MAX 96
+
+struct setto_ctx {
+    uint64_t reg_tick;
+    uint64_t exp_tick;
+    char     msg[SETTO_MSG_MAX];
+};
+
+/** ----------------------------------------------------------------------
+ * @brief setto_cb() – One-shot timer callback for the shell setTimeout.
+ *
+ * Runs in timer IRQ context. Prints the registered / scheduled /
+ * actual-fire times (each converted from ticks to whole seconds via
+ * timer_get_timebase_freq()) alongside the stashed message, then
+ * frees the context. Safe to block briefly on UART because uart_putc
+ * already masks SIE while it touches its ring.
+ * @param arg Pointer to a kmalloc'd struct setto_ctx (transferred in).
+ * -------------------------------------------------------------------- */
+static void setto_cb(void *arg)
+{
+    struct setto_ctx *c = arg;
+    uint64_t hz  = timer_get_timebase_freq();
+    uint64_t now = timer_read_ticks();
+
+    uart_puts("\n[setTimeout] registered=");
+    print_dec_ulong((unsigned long)(c->reg_tick / hz));
+    uart_puts("s scheduled=");
+    print_dec_ulong((unsigned long)(c->exp_tick / hz));
+    uart_puts("s fired=");
+    print_dec_ulong((unsigned long)(now / hz));
+    uart_puts("s : ");
+    uart_puts(c->msg);
+    uart_puts("\n");
+
+    kfree(c);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief shell_set_timeout() – Parse and queue a setTimeout command.
+ *
+ * Grammar: "setTimeout <positive_int_seconds> <message...>".  The
+ * message runs to end-of-line; shell_handle_command() already NUL-
+ * terminates at '\n'. The message is copied into a kmalloc'd context
+ * because the readline buffer is reused on the next keystroke.
+ * @param args Command tail (the characters after "setTimeout ").
+ * -------------------------------------------------------------------- */
+static void shell_set_timeout(const char *args)
+{
+    const char *p = args;
+    while (*p == ' ')
+        p++;
+
+    int sec = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        sec = sec * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || sec <= 0 || *p != ' ') {
+        uart_puts("usage: setTimeout <seconds> <message>\n");
+        return;
+    }
+    while (*p == ' ')
+        p++;
+    if (*p == '\0') {
+        uart_puts("usage: setTimeout <seconds> <message>\n");
+        return;
+    }
+
+    struct setto_ctx *c = kmalloc(sizeof(*c));
+    if (!c) {
+        uart_puts("setTimeout: out of memory\n");
+        return;
+    }
+
+    c->reg_tick = timer_read_ticks();
+    c->exp_tick = c->reg_tick +
+                  (uint64_t)sec * timer_get_timebase_freq();
+
+    unsigned int i = 0;
+    while (p[i] != '\0' && i < SETTO_MSG_MAX - 1) {
+        c->msg[i] = p[i];
+        i++;
+    }
+    c->msg[i] = '\0';
+
+    add_timer(setto_cb, c, sec);
 }
 
 /** ----------------------------------------------------------------------
@@ -261,6 +355,10 @@ static void shell_handle_command(const char *cmd)
         }
     } else if (str_eq(cmd, "exec") != 0) {
         uart_puts("usage: exec <filename>\n");
+    } else if (str_startswith(cmd, "setTimeout ")) {
+        shell_set_timeout(cmd + 11);
+    } else if (str_eq(cmd, "setTimeout") != 0) {
+        uart_puts("usage: setTimeout <seconds> <message>\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);

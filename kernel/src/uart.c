@@ -186,20 +186,6 @@ static inline int ring_pop(struct uart_ring *r)
     return c;
 }
 
-static inline unsigned long sie_save_clear(void)
-{
-    unsigned long prev;
-    asm volatile ("csrrc %0, sstatus, %1"
-                  : "=r"(prev) : "r"((unsigned long)SSTATUS_SIE));
-    return prev & SSTATUS_SIE;
-}
-
-static inline void sie_restore(unsigned long bit)
-{
-    if (bit)
-        asm volatile ("csrs sstatus, %0" :: "r"(bit));
-}
-
 /** ----------------------------------------------------------------------
  * @brief uart_init() – Configure UART0 for interrupt-driven I/O.
  *
