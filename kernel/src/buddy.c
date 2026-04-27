@@ -4,6 +4,13 @@
 #include "utils.h"
 #include "types.h"
 
+/*
+ * Compile-time switch for the noisy per-page trace lines prefixed with
+ * "[+]" / "[-]" / "[*]". Leave undefined to silence them (default); define
+ * to re-enable the verbose pool build / merge traces used during Lab 3.
+ */
+/* #define BUDDY_VERBOSE_LOG */
+
 /* ===== Frame Array ======================================================
  *
  *   frame_array[i] >= 0             : head of a free block of order val
@@ -78,6 +85,7 @@ static int pages_to_order(unsigned long pages)
 
 static void log_add(unsigned long idx, int order)
 {
+#ifdef BUDDY_VERBOSE_LOG
     unsigned long count = 1UL << order;
     uart_puts("[+] Add page ");
     print_dec_ulong(idx);
@@ -88,10 +96,15 @@ static void log_add(unsigned long idx, int order)
     uart_puts(", ");
     print_dec_ulong(idx + count - 1);
     uart_puts("]\n");
+#else
+    (void)idx;
+    (void)order;
+#endif
 }
 
 static void log_remove(unsigned long idx, int order)
 {
+#ifdef BUDDY_VERBOSE_LOG
     unsigned long count = 1UL << order;
     uart_puts("[-] Remove page ");
     print_dec_ulong(idx);
@@ -102,11 +115,16 @@ static void log_remove(unsigned long idx, int order)
     uart_puts(", ");
     print_dec_ulong(idx + count - 1);
     uart_puts("]\n");
+#else
+    (void)idx;
+    (void)order;
+#endif
 }
 
 static void log_buddy_found(unsigned long buddy_idx, unsigned long page_idx,
                             int order)
 {
+#ifdef BUDDY_VERBOSE_LOG
     uart_puts("[*] Buddy found! buddy idx: ");
     print_dec_ulong(buddy_idx);
     uart_puts(" for page ");
@@ -114,28 +132,11 @@ static void log_buddy_found(unsigned long buddy_idx, unsigned long page_idx,
     uart_puts(" with order ");
     print_dec_ulong((unsigned long)order);
     uart_puts("\n");
-}
-
-static void log_alloc(uintptr_t addr, int order, unsigned long page_idx)
-{
-    uart_puts("[Page] Allocate 0x");
-    print_hex_ulong(addr);
-    uart_puts(" at order ");
-    print_dec_ulong((unsigned long)order);
-    uart_puts(", page ");
-    print_dec_ulong(page_idx);
-    uart_puts("\n");
-}
-
-static void log_free(uintptr_t addr, int order, unsigned long page_idx)
-{
-    uart_puts("[Page] Free 0x");
-    print_hex_ulong(addr);
-    uart_puts(" and add back to order ");
-    print_dec_ulong((unsigned long)order);
-    uart_puts(", page ");
-    print_dec_ulong(page_idx);
-    uart_puts("\n");
+#else
+    (void)buddy_idx;
+    (void)page_idx;
+    (void)order;
+#endif
 }
 
 /* ---- Internal: add / remove block from free list ----------------------- */
@@ -317,8 +318,6 @@ void *buddy_alloc(unsigned long size)
         frame_array[idx + i] = ALLOC_TAG(idx, target_order);
 
     uintptr_t addr = idx_to_addr(idx);
-    log_alloc(addr, target_order, idx);
-
     return (void *)addr;
 }
 
@@ -377,8 +376,6 @@ void buddy_free(void *ptr)
 
     /* Place the (possibly merged) block on the appropriate free list. */
     block_push(cur_idx, cur_order);
-
-    log_free(addr, cur_order, cur_idx);
 }
 
 /* ===== Startup Allocator ==================================================
@@ -493,11 +490,13 @@ void buddy_startup_reserve(uintptr_t start, uintptr_t end)
     g_sa_reserves[g_sa_reserve_count].end   = end;
     g_sa_reserve_count++;
 
+#ifdef BUDDY_VERBOSE_LOG
     uart_puts("[Startup] Reserve 0x");
     print_hex_ulong(start);
     uart_puts(" - 0x");
     print_hex_ulong(end);
     uart_puts("\n");
+#endif
 }
 
 void *buddy_startup_alloc(unsigned long size)

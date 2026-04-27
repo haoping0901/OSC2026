@@ -22,6 +22,16 @@ int str_startswith(const char *str, const char *prefix)
     return 1;
 }
 
+void *mem_cpy(void *dst, const void *src, unsigned long n)
+{
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dst;
+}
+
 void print_hex_ulong(unsigned long x)
 {
     char buf[2 * sizeof(unsigned long)];
@@ -38,6 +48,25 @@ void print_hex_ulong(unsigned long x)
     }
 
     for (i = 0; i < (int)(sizeof(unsigned long) * 2); ++i) {
+        uart_putc((unsigned char)buf[i]);
+    }
+}
+
+void print_hex_u32(unsigned int x)
+{
+    char buf[8];
+    int i;
+
+    for (i = 7; i >= 0; --i) {
+        unsigned int nibble = x & 0xFU;
+        if (nibble < 10U) {
+            buf[i] = (char)('0' + nibble);
+        } else {
+            buf[i] = (char)('a' + (nibble - 10U));
+        }
+        x >>= 4;
+    }
+    for (i = 0; i < 8; ++i) {
         uart_putc((unsigned char)buf[i]);
     }
 }

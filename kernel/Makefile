@@ -68,7 +68,13 @@ rootfs/hello.txt:
 	mkdir -p rootfs
 	echo "Hello world from initramfs!" > rootfs/hello.txt
 
-initramfs.cpio: rootfs/hello.txt
+# Stage the pre-built user program into rootfs/ so it ends up inside
+# the initramfs cpio archive. prog.bin is committed in the kernel/ tree.
+rootfs/prog.bin: prog.bin
+	mkdir -p rootfs
+	cp prog.bin rootfs/prog.bin
+
+initramfs.cpio: rootfs/hello.txt rootfs/prog.bin
 	cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio
 
 test: qemu initramfs.cpio

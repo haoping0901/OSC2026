@@ -4,6 +4,10 @@
 #include "types.h"
 #include "buddy.h"
 #include "kmalloc.h"
+#include "trap.h"
+#include "timer.h"
+#include "plic.h"
+#include "riscv.h"
 #include "utils.h"
 
 /* Kernel image boundaries exported by the linker script. */
@@ -99,13 +103,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
     unsigned long fa_bytes       = total_pages * sizeof(int);
     unsigned long ppi_bytes      = total_pages * sizeof(signed char);
 
-    uart_puts("[Startup] Allocating frame array (");
-    print_dec_ulong(fa_bytes);
-    uart_puts(" bytes)...\n");
     int         *frame_array    = (int *)buddy_startup_alloc(fa_bytes);
-    uart_puts("[Startup] Allocating page pool index (");
-    print_dec_ulong(ppi_bytes);
-    uart_puts(" bytes)...\n");
     signed char *page_pool_idx  = (signed char *)buddy_startup_alloc(ppi_bytes);
 
     /* Step 7: Initialize the buddy allocator with the dynamically
@@ -123,7 +121,52 @@ int main(unsigned long hart_id, void *dtb_ptr)
     /* Step 10: Initialize the dynamic memory allocator (chunk pools). */
     kmalloc_init(page_pool_idx, total_pages);
 
-    /* Step 11: Continue with the interactive shell. */
+    /* Step 11: Install the S-mode trap vector before any user program
+     * can execute ecall or hit an exception. */
+    trap_init();
+    uart_puts("[Trap] stvec installed.\n");
+
+    /* Step 12: Configure UART0 + PLIC for interrupt-driven I/O (Ex3).
+     * Must run BEFORE timer_init(): once sstatus.SIE is on, timer IRQs
+     * call uart_puts() from the handler; routing that through the ring
+     * buffer avoids re-entering the LSR.TDRQ busy-wait while the main
+     * thread is also writing.                                          */
+    uart_init();
+    uart_puts("[UART] RX/TX IRQ configured.\n");
+
+    /* PLIC node name differs across platforms: QEMU virt exposes it as
+     * "plic@..." while the OrangePi RV2 DTS labels it
+     * "interrupt-controller@...". Both still live under /soc. */
+#ifdef QEMU
+    uintptr_t plic_base = dtb_getprop("/soc/plic", "reg");
+#else
+    uintptr_t plic_base = dtb_getprop("/soc/interrupt-controller",
+                                     "reg");
+#endif
+    unsigned int uart_irq = (unsigned int)dtb_getprop("/soc/serial",
+                                                     "interrupts");
+
+    unsigned int plic_ctx = PLIC_CTX_HART_S(hart_id);
+    plic_init(plic_base, uart_irq, plic_ctx);
+    trap_set_uart_irq(uart_irq);
+
+    /* Enable S-mode external interrupts. sstatus.SIE is still off at
+     * this point (timer_init has not run yet); it will be turned on
+     * by timer_init() below. */
+    asm volatile ("csrs sie, %0" :: "r"((unsigned long)SIE_SEIE));
+    uart_enable_irq_mode();
+
+    uart_puts("[PLIC] UART0 IRQ ");
+    print_dec_ulong(uart_irq);
+    uart_puts(" enabled (ctx ");
+    print_dec_ulong(plic_ctx);
+    uart_puts(").\n");
+
+    /* Step 13: Enable the core timer interrupt (Ex2). */
+    timer_init();
+    uart_puts("[Timer] Core timer interrupt enabled.\n");
+
+    /* Step 14: Continue with the interactive shell. */
     shell();
 
     return 0;
