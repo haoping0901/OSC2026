@@ -14,15 +14,16 @@
 void timer_init(void);
 
 /*
- * timer_handle_interrupt() – S-mode timer IRQ bottom half.
+ * timer_top_half() – S-mode timer IRQ entry from trap dispatcher.
  *
- * Drains every timer node whose expire_tick has already passed (one
- * IRQ may service several due to dispatch latency), invokes their
- * callbacks, then reprograms the hardware timer to the new queue
- * head. When the queue is empty the timer is pushed infinitely far
- * into the future so no spurious IRQ follows.
+ * Masks sie.STIE for the duration of queue mutation, drains every
+ * expired timer node, hands each user callback to the bottom-half
+ * task queue (so it runs with sstatus.SIE = 1 and can be preempted
+ * by higher-priority device IRQs), reprograms the hardware timer for
+ * the new queue head, then re-enables sie.STIE. The actual user
+ * callback invocation happens later, from task_run_pending().
  */
-void timer_handle_interrupt(void);
+void timer_top_half(void);
 
 /*
  * add_timer() – Register a one-shot callback fired @sec seconds from now.

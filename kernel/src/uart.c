@@ -1,6 +1,8 @@
 #include "uart.h"
 #include "riscv.h"
 #include "types.h"
+#include "task.h"
+#include "plic.h"
 
 /* Runtime UART base address – overridden by uart_set_base() after DTB parse */
 static volatile unsigned long g_uart_base;
@@ -224,14 +226,21 @@ void uart_enable_irq_mode(void)
 }
 
 /** ----------------------------------------------------------------------
- * @brief uart_handle_interrupt() – UART ISR entry from trap dispatcher.
+ * @brief uart_top_half() – Fast-path UART ISR run in trap context.
  *
- * Drains all pending RX bytes into rx_buf, then if TX FIFO has room
- * pops from tx_buf into THR. Clears IER.TIE once tx_buf drains so the
- * TX event stops re-asserting. Safe to call with a spurious claim —
- * returns immediately when IIR reports "no interrupt".
+ * Drains every pending RX byte into rx_buf and pushes as many tx_buf
+ * bytes as the TX FIFO accepts. Both ring transfers are bounded and
+ * cheap, so they can stay in IRQ context — the heavy lift (the PLIC
+ * unmask) is deferred. The PLIC claim/complete protocol guarantees
+ * the same source will not re-fire until plic_complete(); by enqueuing
+ * the unmask as a bottom-half task we get the lab-required "mask in
+ * top half, unmask in BH" semantics for free.
+ *
+ * Falls back to a synchronous plic_complete() if add_task() fails so
+ * an OOM cannot wedge the UART line forever.
+ * @param irq IRQ id returned by plic_claim() in the trap dispatcher.
  * -------------------------------------------------------------------- */
-void uart_handle_interrupt(void)
+void uart_top_half(unsigned int irq)
 {
     while (mmio_read(UART_BASE + UART_LSR) & LSR_DR) {
         unsigned char ch = mmio_read(UART_BASE + UART_RBR) & 0xFF;
@@ -249,6 +258,27 @@ void uart_handle_interrupt(void)
         if (ier & IER_TIE)
             mmio_write(UART_BASE + UART_IER, ier & ~IER_TIE);
     }
+
+    if (add_task(uart_bottom_half, (void *)(uintptr_t)irq,
+                 UART_TASK_PRIO) != 0) {
+        /* OOM: skip the BH and complete here so the line unmasks. */
+        plic_complete(irq);
+    }
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uart_bottom_half() – Unmask the UART PLIC source.
+ *
+ * Runs from task_run_pending() with sstatus.SIE = 1. The actual byte-
+ * level work is consumed by uart_getc() in shell context; this BH
+ * exists primarily as the unmask hook required by the spec, and as
+ * the place to put any future heavier post-IRQ processing.
+ * @param arg IRQ id (cast through uintptr_t) supplied by uart_top_half().
+ * -------------------------------------------------------------------- */
+void uart_bottom_half(void *arg)
+{
+    unsigned int irq = (unsigned int)(uintptr_t)arg;
+    plic_complete(irq);
 }
 
 /* -----------------------------------------------------------------------

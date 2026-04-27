@@ -62,26 +62,6 @@ static inline unsigned long addr_to_page_idx(uintptr_t addr)
     return (addr - buddy_get_base()) / PAGE_SIZE;
 }
 
-/* ---- Logging ----------------------------------------------------------- */
-
-static void log_chunk_alloc(uintptr_t addr, unsigned long chunk_size)
-{
-    uart_puts("[Chunk] Allocate 0x");
-    print_hex_ulong(addr);
-    uart_puts(" at chunk size ");
-    print_dec_ulong(chunk_size);
-    uart_puts("\n");
-}
-
-static void log_chunk_free(uintptr_t addr, unsigned long chunk_size)
-{
-    uart_puts("[Chunk] Free 0x");
-    print_hex_ulong(addr);
-    uart_puts(" at chunk size ");
-    print_dec_ulong(chunk_size);
-    uart_puts("\n");
-}
-
 /* ===== Public API ======================================================= */
 
 void kmalloc_init(signed char *ext_page_pool_idx, unsigned long page_count)
@@ -119,7 +99,7 @@ void *kmalloc(unsigned long size)
             for (unsigned long i = 0; i < pages; i++)
                 page_pool_idx[base + i] = -1;
         }
-        return ptr;  /* buddy_alloc already logs */
+        return ptr;
     }
 
     /* ---- Small allocation: use chunk pool ---- */
@@ -149,7 +129,6 @@ void *kmalloc(unsigned long size)
     chunk_node_t *chunk = pool->free_list;
     pool->free_list = chunk->next;
 
-    log_chunk_alloc((uintptr_t)chunk, pool->chunk_size);
     return (void *)chunk;
 }
 
@@ -168,7 +147,7 @@ void kfree(void *ptr)
 
     if (pidx < 0) {
         /* Large allocation — delegate to buddy. */
-        buddy_free(ptr);   /* buddy_free already logs */
+        buddy_free(ptr);
         return;
     }
 
@@ -177,6 +156,4 @@ void kfree(void *ptr)
     chunk_node_t *node = (chunk_node_t *)ptr;
     node->next = pool->free_list;
     pool->free_list = node;
-
-    log_chunk_free(addr, pool->chunk_size);
 }

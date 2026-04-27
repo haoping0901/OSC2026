@@ -3,6 +3,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "plic.h"
+#include "task.h"
 #include "utils.h"
 #include "types.h"
 
@@ -59,19 +60,27 @@ void trap_handler(struct trap_frame *tf)
 {
     uintptr_t cause = tf->scause;
 
-    /* Interrupt: dispatch by interrupt cause code. */
+    /* Interrupt: top half only — bottom-half work is drained from
+     * task_run_pending() below with sstatus.SIE = 1 so a higher-
+     * priority device can preempt the running callback. */
     if (cause & SCAUSE_INTR_BIT) {
         uintptr_t code = cause & ~SCAUSE_INTR_BIT;
 
         if (code == INTR_S_TIMER) {
-            timer_handle_interrupt();
+            timer_top_half();
         } else if (code == INTR_S_EXT) {
             unsigned int irq = plic_claim();
-            if (irq == g_uart_irq && irq != 0)
-                uart_handle_interrupt();
-            if (irq != 0)
+            if (irq == g_uart_irq && irq != 0) {
+                /* UART defers plic_complete() to its bottom half so
+                 * the source stays masked at the PLIC until the BH
+                 * unmasks it (lab spec: "unmask at task completion"). */
+                uart_top_half(irq);
+            } else if (irq != 0) {
                 plic_complete(irq);
+            }
         }
+
+        task_run_pending();
         return;
     }
 

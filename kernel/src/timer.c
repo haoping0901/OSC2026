@@ -7,6 +7,7 @@
 #include "types.h"
 #include "list.h"
 #include "kmalloc.h"
+#include "task.h"
 
 #define DEFAULT_TIMEBASE_FREQ	0x989680UL	/* QEMU virt fallback: 10 MHz */
 
@@ -136,15 +137,20 @@ void add_timer(void (*callback)(void *), void *arg, int sec)
 }
 
 /** ----------------------------------------------------------------------
- * @brief timer_handle_interrupt() – Drain expired timers, rearm the HW.
+ * @brief timer_top_half() – Drain expired timers, hand cbs to BH queue.
  *
- * A single IRQ may cover multiple already-expired nodes when dispatch
- * was delayed (e.g. shell held SIE cleared for a while), so this loop
- * pops every node whose expire_tick has passed before rearming. If
- * the queue empties, the hardware timer is parked at (uint64_t)-1.
- * Callbacks are invoked in IRQ context and must be short.
+ * Walks g_timer_queue from the head, popping every node whose
+ * expire_tick has passed. Each user callback is enqueued via
+ * add_task() at TIMER_TASK_PRIO instead of being run inline so it
+ * later executes from task_run_pending() with sstatus.SIE = 1 — that
+ * lets a higher-priority device (UART) preempt the timer callback.
+ *
+ * The hardware timer is one-shot, so no explicit interrupt-line mask
+ * is needed: until sbi_set_timer() rearms it at the bottom of this
+ * function, no further timer IRQ can fire. add_task() failure
+ * degrades to a synchronous call so a timeout is never silently lost.
  * -------------------------------------------------------------------- */
-void timer_handle_interrupt(void)
+void timer_top_half(void)
 {
 	uint64_t now = read_time();
 
@@ -155,7 +161,10 @@ void timer_handle_interrupt(void)
 			break;
 
 		list_del(&t->link);
-		t->cb(t->arg);
+		if (add_task(t->cb, t->arg, TIMER_TASK_PRIO) != 0) {
+			/* OOM fallback: keep semantics over preemption. */
+			t->cb(t->arg);
+		}
 		kfree(t);
 	}
 

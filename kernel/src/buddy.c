@@ -139,28 +139,6 @@ static void log_buddy_found(unsigned long buddy_idx, unsigned long page_idx,
 #endif
 }
 
-static void log_alloc(uintptr_t addr, int order, unsigned long page_idx)
-{
-    uart_puts("[Page] Allocate 0x");
-    print_hex_ulong(addr);
-    uart_puts(" at order ");
-    print_dec_ulong((unsigned long)order);
-    uart_puts(", page ");
-    print_dec_ulong(page_idx);
-    uart_puts("\n");
-}
-
-static void log_free(uintptr_t addr, int order, unsigned long page_idx)
-{
-    uart_puts("[Page] Free 0x");
-    print_hex_ulong(addr);
-    uart_puts(" and add back to order ");
-    print_dec_ulong((unsigned long)order);
-    uart_puts(", page ");
-    print_dec_ulong(page_idx);
-    uart_puts("\n");
-}
-
 /* ---- Internal: add / remove block from free list ----------------------- */
 
 /** Put free block starting at @idx of given @order onto its free list. */
@@ -340,8 +318,6 @@ void *buddy_alloc(unsigned long size)
         frame_array[idx + i] = ALLOC_TAG(idx, target_order);
 
     uintptr_t addr = idx_to_addr(idx);
-    log_alloc(addr, target_order, idx);
-
     return (void *)addr;
 }
 
@@ -400,8 +376,6 @@ void buddy_free(void *ptr)
 
     /* Place the (possibly merged) block on the appropriate free list. */
     block_push(cur_idx, cur_order);
-
-    log_free(addr, cur_order, cur_idx);
 }
 
 /* ===== Startup Allocator ==================================================

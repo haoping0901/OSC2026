@@ -7,6 +7,7 @@
 #include "kmalloc.h"
 #include "trap.h"
 #include "timer.h"
+#include "task.h"
 #include "types.h"
 
 #define USER_STACK_SIZE  (16 * 1024)  /* 16 KiB user stack for prog.bin */
@@ -31,6 +32,46 @@ static void shell_print_help(void)
     uart_puts("  exec  - load a user program from initrd and run it in U-mode.\n");
     uart_puts("  test  - run memory allocator test.\n");
     uart_puts("  setTimeout <sec> <msg> - print msg after sec seconds.\n");
+    uart_puts("  taskdemo - enqueue 3 tasks out of priority order.\n");
+    uart_puts("  tasknest - nested priority dispatch demo (start -> inner -> end).\n");
+}
+
+/* ---------- taskdemo / tasknest (Advanced Ex2: bottom-half tasks) ------- */
+
+/** ----------------------------------------------------------------------
+ * @brief demo_task_short() – Print a single tagged line.
+ *
+ * Bottom-half callback used by the taskdemo command. The integer
+ * priority is smuggled through the void* arg via uintptr_t cast so
+ * the demo does not need to allocate per-task context.
+ * @param arg Priority value (cast through uintptr_t) stamped on output.
+ * -------------------------------------------------------------------- */
+static void demo_task_short(void *arg)
+{
+    int p = (int)(uintptr_t)arg;
+    uart_puts("[task pri=");
+    print_dec_ulong((unsigned long)p);
+    uart_puts("] hello\n");
+}
+
+/** ----------------------------------------------------------------------
+ * @brief demo_task_slow() – Synchronous nested-priority dispatch demo.
+ *
+ * Runs at priority 9. Mid-flight it enqueues a higher-priority (5)
+ * task and calls task_run_pending() itself; the nested dispatcher
+ * sees 5 < 9 and runs the inner task before returning, so the inner
+ * "[task pri=...] hello" line lands between this task's start / end
+ * markers. This is the same g_running_priority gate that implements
+ * IRQ-driven preemption — synthesised synchronously here so the demo
+ * is reproducible without external input. arg is unused.
+ * -------------------------------------------------------------------- */
+static void demo_task_slow(void *arg)
+{
+    (void)arg;
+    uart_puts("[slow pri=9] start\n");
+    add_task(demo_task_short, (void *)(uintptr_t)123, 5);
+    task_run_pending();
+    uart_puts("[slow pri=9] end\n");
 }
 
 /* ---------- setTimeout (Advanced Ex1: timer multiplexing) --------------- */
@@ -359,6 +400,25 @@ static void shell_handle_command(const char *cmd)
         shell_set_timeout(cmd + 11);
     } else if (str_eq(cmd, "setTimeout") != 0) {
         uart_puts("usage: setTimeout <seconds> <message>\n");
+    } else if (str_eq(cmd, "taskdemo") != 0) {
+        /* Enqueue three tasks in scrambled priority order. Expected
+         * stdout is 1, 3, 5 — confirming the queue is priority-sorted
+         * and equal priorities preserve FIFO. The shell is in thread
+         * context (SIE = 1) so add_task is safe; we then call
+         * task_run_pending() once to drain immediately rather than
+         * waiting for the next IRQ. */
+        add_task(demo_task_short, (void *)(uintptr_t)3, 3);
+        add_task(demo_task_short, (void *)(uintptr_t)1, 1);
+        add_task(demo_task_short, (void *)(uintptr_t)5, 5);
+        task_run_pending();
+    } else if (str_eq(cmd, "tasknest") != 0) {
+        /* Schedule a priority-9 task that itself enqueues a pri=5
+         * task and yields via task_run_pending(). Output order
+         * (start -> inner pri=5 -> end) confirms the strict-< gate
+         * in g_running_priority lets the inner task preempt before
+         * the outer one finishes. */
+        add_task(demo_task_slow, NULL, 9);
+        task_run_pending();
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);
