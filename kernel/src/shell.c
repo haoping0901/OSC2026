@@ -8,6 +8,7 @@
 #include "trap.h"
 #include "timer.h"
 #include "task.h"
+#include "sched.h"
 #include "types.h"
 
 #define USER_STACK_SIZE  (16 * 1024)  /* 16 KiB user stack for prog.bin */
@@ -34,6 +35,34 @@ static void shell_print_help(void)
     uart_puts("  setTimeout <sec> <msg> - print msg after sec seconds.\n");
     uart_puts("  taskdemo - enqueue 3 tasks out of priority order.\n");
     uart_puts("  tasknest - nested priority dispatch demo (start -> inner -> end).\n");
+    uart_puts("  threadtest - spawn 3 cooperative threads (Lab5 Basic Ex1).\n");
+}
+
+/* ---------- threadtest (Lab5 Basic Ex1: cooperative threads) ----------- */
+
+/** ----------------------------------------------------------------------
+ * @brief demo_thread_body() – Worker body for the threadtest demo.
+ *
+ * Loops five times: prints its own tid + iteration, busy-waits for a
+ * visible interval, then yields via schedule(). Returning naturally
+ * from this function falls through the trampoline into thread_exit(),
+ * which marks the thread zombie so the idle thread eventually reaps
+ * it. Output from three concurrent invocations should interleave
+ * round-robin, confirming the context switch works.
+ * -------------------------------------------------------------------- */
+static void demo_thread_body(void)
+{
+    int id = get_current()->tid;
+    for (int i = 0; i < 5; i++) {
+        uart_puts("Thread id: ");
+        print_dec_ulong((unsigned long)id);
+        uart_puts(" iter ");
+        print_dec_ulong((unsigned long)i);
+        uart_puts("\n");
+        for (volatile int j = 0; j < 1000000; j++)
+            ;
+        schedule();
+    }
 }
 
 /* ---------- taskdemo / tasknest (Advanced Ex2: bottom-half tasks) ------- */
@@ -419,6 +448,19 @@ static void shell_handle_command(const char *cmd)
          * the outer one finishes. */
         add_task(demo_task_slow, NULL, 9);
         task_run_pending();
+    } else if (str_eq(cmd, "threadtest") != 0) {
+        /* Spawn three worker threads and yield from the shell several
+         * times so they all get a turn. After every worker calls
+         * thread_exit() the run queue narrows back to just the
+         * bootstrap and idle threads, at which point schedule() lands
+         * us back here and the loop exits. The idle thread reaps the
+         * zombies on its own cycle. */
+        thread_create(demo_thread_body);
+        thread_create(demo_thread_body);
+        thread_create(demo_thread_body);
+        for (int i = 0; i < 20; i++)
+            schedule();
+        uart_puts("[threadtest] back in shell\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);

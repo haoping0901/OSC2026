@@ -8,6 +8,7 @@
 #include "timer.h"
 #include "plic.h"
 #include "riscv.h"
+#include "sched.h"
 #include "utils.h"
 
 /* Kernel image boundaries exported by the linker script. */
@@ -166,7 +167,14 @@ int main(unsigned long hart_id, void *dtb_ptr)
     timer_init();
     uart_puts("[Timer] Core timer interrupt enabled.\n");
 
-    /* Step 14: Continue with the interactive shell. */
+    /* Step 14: Adopt the boot context as the bootstrap thread and
+     * spawn the idle thread (Lab5 Basic Ex1). After this point any
+     * code running on the main path is "the bootstrap thread"; any
+     * future thread_create()/schedule() call composes correctly. */
+    sched_init();
+    uart_puts("[Sched] bootstrap + idle thread ready.\n");
+
+    /* Step 15: Continue with the interactive shell. */
     shell();
 
     return 0;
