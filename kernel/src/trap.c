@@ -6,6 +6,8 @@
 #include "task.h"
 #include "utils.h"
 #include "types.h"
+#include "syscall.h"
+#include "sched.h"
 
 /* UART0 IRQ id (from DTB). Set via trap_set_uart_irq() before SEIE. */
 static unsigned int g_uart_irq;
@@ -81,6 +83,39 @@ void trap_handler(struct trap_frame *tf)
         }
 
         task_run_pending();
+
+        /*
+         * Preemption gate (Lab5 Basic Ex2): if a timer tick set the
+         * need_resched flag and we are returning to U-mode, yield to
+         * the next runnable thread. We do this here (trap context)
+         * rather than inside the IRQ handler so that switch_to() can
+         * safely change kernel stacks. SPP=0 means the trap was
+         * taken from U-mode, which is the only case where we want to
+         * preempt — preempting kernel threads would break the lab's
+         * cooperative semantics for kernel-only paths.
+         */
+        if (need_resched_clear()
+            && (tf->sstatus & SSTATUS_SPP) == 0)
+            schedule();
+        return;
+    }
+
+    if (cause == EXC_ECALL_U) {
+        /* Skip the ecall instruction (always 4 bytes in RV64I) BEFORE
+         * dispatching: sys_fork() copies the current sepc verbatim
+         * into the child's trap_frame, so it must already point at
+         * the instruction after the ecall. */
+        tf->sepc += 4;
+
+        /* Re-enable interrupts during syscall processing so that
+         * blocking calls (like sys_uart_read) can still receive
+         * UART interrupts. */
+        asm volatile ("csrs sstatus, %0" :: "r"((unsigned long)SSTATUS_SIE));
+
+        tf->a0 = (uintptr_t)do_syscall(tf);
+
+        if (need_resched_clear())
+            schedule();
         return;
     }
 
@@ -101,12 +136,6 @@ void trap_handler(struct trap_frame *tf)
     uart_puts("stval: ");
     print_dec_ulong(tf->stval);
     uart_puts("\n");
-
-    if (cause == EXC_ECALL_U) {
-        /* Skip the ecall instruction (always 4 bytes in RV64I). */
-        tf->sepc += 4;
-        return;
-    }
 
     uart_puts("[trap] unhandled exception, halting.\n");
     for (;;) {

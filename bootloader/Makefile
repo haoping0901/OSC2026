@@ -75,7 +75,12 @@ rootfs/prog.bin: prog.bin
 	mkdir -p rootfs
 	cp prog.bin rootfs/prog.bin
 
-initramfs.cpio: rootfs/hello.txt rootfs/prog.bin
+# Lab5 Basic Ex2 fork_test binary, supplied by the course.
+rootfs/osctest.bin: osctest.bin
+	mkdir -p rootfs
+	cp osctest.bin rootfs/osctest.bin
+
+initramfs.cpio: rootfs/hello.txt rootfs/prog.bin rootfs/osctest.bin
 	cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio
 
 test: qemu initramfs.cpio

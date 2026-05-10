@@ -8,8 +8,18 @@
 #include "list.h"
 #include "kmalloc.h"
 #include "task.h"
+#include "sched.h"
 
 #define DEFAULT_TIMEBASE_FREQ	0x989680UL	/* QEMU virt fallback: 10 MHz */
+
+/*
+ * Hard upper bound on the next timer IRQ. Even when the user timer
+ * queue is empty, we keep arming the hardware timer so timer_top_half()
+ * runs periodically and can flag need_resched. With a 10 MHz timebase
+ * this is ~10 ms — fine-grained enough to make U-mode preemption
+ * visible, coarse enough to avoid IRQ storms.
+ */
+#define SCHED_TICK_DIV	100		/* timebase / 100 ≈ 10 ms on QEMU */
 
 static uint64_t g_timebase_freq;
 
@@ -80,7 +90,7 @@ void timer_init(void)
 	if (g_timebase_freq == 0)
 		g_timebase_freq = DEFAULT_TIMEBASE_FREQ;
 
-	/* Park the hardware timer: no pending timers means no IRQ wanted. */
+	/* Park the hardware timer until add_timer() or timer_top_half() rearms it. */
 	sbi_set_timer((uint64_t)-1);
 
 	/* Enable the per-source switch (sie.STIE). */
@@ -168,11 +178,20 @@ void timer_top_half(void)
 		kfree(t);
 	}
 
+	/*
+	 * Always rearm with at least the scheduler tick deadline so that
+	 * U-mode preemption keeps firing even when no user timers are
+	 * registered. If a user timer is sooner, prefer it.
+	 */
+	uint64_t next = now + g_timebase_freq / SCHED_TICK_DIV;
 	if (!list_empty(&g_timer_queue)) {
 		struct timer_node *h = list_entry(g_timer_queue.next,
 		                                  struct timer_node, link);
-		sbi_set_timer(h->expire_tick);
-	} else {
-		sbi_set_timer((uint64_t)-1);
+		if (h->expire_tick < next)
+			next = h->expire_tick;
 	}
+	sbi_set_timer(next);
+
+	/* Mark the current thread for preemption on the way back to U. */
+	set_need_resched();
 }
