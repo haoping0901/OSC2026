@@ -19,7 +19,7 @@
  * this is ~10 ms — fine-grained enough to make U-mode preemption
  * visible, coarse enough to avoid IRQ storms.
  */
-#define SCHED_TICK_DIV	100		/* timebase / 100 ≈ 10 ms on QEMU */
+#define SCHED_TICK_DIV	32		/* timebase / 32 ≈ 31.25 ms (1/32 s) */
 
 static uint64_t g_timebase_freq;
 
@@ -80,9 +80,9 @@ uint64_t timer_read_ticks(void)
  *
  * Probes timebase-frequency from the DTB /cpus node (fallback 10 MHz
  * for QEMU virt), then enables sie.STIE and sstatus.SIE. The hardware
- * timer is pushed to the distant future — with an empty queue there
- * is nothing to fire yet, and add_timer() will reprogram it as soon
- * as the first entry is registered.
+ * timer is armed for the first scheduler tick at +1/SCHED_TICK_DIV s
+ * so timer_top_half() starts firing immediately after boot, even
+ * before any add_timer*() caller has registered an entry.
  * -------------------------------------------------------------------- */
 void timer_init(void)
 {
@@ -90,8 +90,8 @@ void timer_init(void)
 	if (g_timebase_freq == 0)
 		g_timebase_freq = DEFAULT_TIMEBASE_FREQ;
 
-	/* Park the hardware timer until add_timer() or timer_top_half() rearms it. */
-	sbi_set_timer((uint64_t)-1);
+	/* Arm the first scheduler tick (1/SCHED_TICK_DIV s) right after init. */
+	sbi_set_timer(read_time() + g_timebase_freq / SCHED_TICK_DIV);
 
 	/* Enable the per-source switch (sie.STIE). */
 	asm volatile ("csrs sie, %0" :: "r"((unsigned long)SIE_STIE));
@@ -101,18 +101,19 @@ void timer_init(void)
 }
 
 /** ----------------------------------------------------------------------
- * @brief add_timer() – Register a one-shot callback after @sec seconds.
+ * @brief add_timer_ticks() – Internal helper shared by add_timer*().
  *
- * Inserts the new node into the queue ordered by expire_tick. If the
- * freshly inserted node becomes the earliest (queue head), the
- * hardware timer is reprogrammed via sbi_set_timer(). The whole
- * queue mutation runs with sstatus.SIE cleared to keep the timer IRQ
- * handler from racing against the walker.
+ * Allocates a node, fills it for an absolute expire time of
+ * (now + @ticks), inserts it into the queue ordered by expire_tick,
+ * and reprograms the hardware timer when the new node becomes the
+ * earliest. Runs the queue mutation with sstatus.SIE cleared so the
+ * timer IRQ handler cannot race against the walker.
  * @param callback Function to invoke in IRQ context on expiry.
  * @param arg      Opaque pointer handed to the callback verbatim.
- * @param sec      Delay in whole seconds.
+ * @param ticks    Delay in timebase ticks.
  * -------------------------------------------------------------------- */
-void add_timer(void (*callback)(void *), void *arg, int sec)
+static void add_timer_ticks(void (*callback)(void *), void *arg,
+                            uint64_t ticks)
 {
 	struct timer_node *n = kmalloc(sizeof(*n));
 	if (!n)
@@ -120,7 +121,7 @@ void add_timer(void (*callback)(void *), void *arg, int sec)
 
 	uint64_t now = read_time();
 	n->register_tick = now;
-	n->expire_tick   = now + (uint64_t)sec * g_timebase_freq;
+	n->expire_tick   = now + ticks;
 	n->cb            = callback;
 	n->arg           = arg;
 
@@ -144,6 +145,36 @@ void add_timer(void (*callback)(void *), void *arg, int sec)
 		sbi_set_timer(n->expire_tick);
 
 	sie_restore(flags);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief add_timer() – Register a one-shot callback after @sec seconds.
+ *
+ * Thin second-granularity wrapper over add_timer_ticks().
+ * @param callback Function to invoke in IRQ context on expiry.
+ * @param arg      Opaque pointer handed to the callback verbatim.
+ * @param sec      Delay in whole seconds.
+ * -------------------------------------------------------------------- */
+void add_timer(void (*callback)(void *), void *arg, int sec)
+{
+	add_timer_ticks(callback, arg, (uint64_t)sec * g_timebase_freq);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief add_timer_us() – Register a callback after @usec microseconds.
+ *
+ * Converts microseconds to ticks via the DTB-probed timebase frequency
+ * before delegating to add_timer_ticks(). Sub-tick delays are rounded
+ * down to zero ticks, in which case the callback fires on the very
+ * next timer IRQ.
+ * @param callback Function to invoke in IRQ context on expiry.
+ * @param arg      Opaque pointer handed to the callback verbatim.
+ * @param usec     Delay in microseconds.
+ * -------------------------------------------------------------------- */
+void add_timer_us(void (*callback)(void *), void *arg, uint64_t usec)
+{
+	uint64_t ticks = g_timebase_freq * usec / 1000000ULL;
+	add_timer_ticks(callback, arg, ticks);
 }
 
 /** ----------------------------------------------------------------------

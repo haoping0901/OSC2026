@@ -21,7 +21,7 @@ SRC_DIR   = src
 BUILD_DIR = build/$(PLATFORM)
 TARGET    = kernel
 
-CFLAGS  = -march=rv64gc_zifencei -mabi=lp64d -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
+CFLAGS  = -march=rv64gc_zifencei_zicbom -mabi=lp64d -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
 LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) --no-warn-rwx-segments
 
 # Source files and corresponding object files
@@ -62,7 +62,7 @@ $(TARGET).fit: $(TARGET).bin initramfs.cpio
 
 # Run the kernel in QEMU
 QEMU = qemu-system-riscv64
-QEMU_OPTS = -M virt -m 8G -display none -serial stdio
+QEMU_OPTS = -M virt -m 8G -serial stdio -vga none -device ramfb
 
 rootfs/hello.txt:
 	mkdir -p rootfs

@@ -10,6 +10,8 @@
 #include "riscv.h"
 #include "utils.h"
 #include "types.h"
+#include "video.h"
+#include "timer.h"
 
 /*
  * Lab5 Basic Ex2 system-call layer.
@@ -376,6 +378,72 @@ static long sys_stop(long pid)
 }
 
 /** ----------------------------------------------------------------------
+ * @brief sys_display() – Center-blit a user BMP buffer to framebuffer.
+ *
+ * Validates the @bmp pointer and dimensions: width/height must fit
+ * inside the physical framebuffer so the centered placement does not
+ * walk off the FB, and [bmp, bmp + w*h*4) must lie inside the caller's
+ * image buffer. Computes the byte length as (uint64_t)w*h*4 to avoid a
+ * 32-bit overflow when w*h is close to the FB size.
+ * @param bmp User-space pixel array (XRGB8888).
+ * @param w   Image width in pixels.
+ * @param h   Image height in pixels.
+ * @return 0 on success, -1 on argument validation failure.
+ * -------------------------------------------------------------------- */
+static long sys_display(unsigned int *bmp, unsigned int w, unsigned int h)
+{
+    if (w == 0 || h == 0 || w > FB_WIDTH || h > FB_HEIGHT)
+        return -1;
+    uint64_t bytes = (uint64_t)w * (uint64_t)h * 4ULL;
+    if (!in_user_range(bmp, (unsigned long)bytes))
+        return -1;
+    video_bmp_display(bmp, (int)w, (int)h);
+    return 0;
+}
+
+/* Wakeup token planted on the sleeping thread's kernel stack. The
+ * timer callback runs from the bottom-half task queue and only needs
+ * the thread pointer to wake the sleeper. */
+struct usleep_token {
+    struct thread *t;
+};
+
+/** ----------------------------------------------------------------------
+ * @brief usleep_cb() – Timer expiry callback for sys_usleep().
+ *
+ * Wakes the sleeping thread that registered the timer. Safe to run
+ * from the bottom-half task queue because thread_wakeup() is itself
+ * IRQ-safe (sie_save_clear inside).
+ * @param arg Pointer to the sleeper's stack-allocated usleep_token.
+ * -------------------------------------------------------------------- */
+static void usleep_cb(void *arg)
+{
+    struct usleep_token *s = (struct usleep_token *)arg;
+    thread_wakeup(s->t);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_usleep() – Block the caller for @usec microseconds.
+ *
+ * Implements userspace usleep() by registering a microsecond-resolution
+ * timer that targets the current thread, then thread_block()ing. The
+ * token lives on the caller's kernel stack: the kstack is not freed
+ * while the thread is BLOCKED, so it stays valid until the callback
+ * runs and we resume past thread_block().
+ * @param usec Microseconds to sleep. 0 returns immediately.
+ * @return 0 on success.
+ * -------------------------------------------------------------------- */
+static long sys_usleep(unsigned int usec)
+{
+    if (usec == 0)
+        return 0;
+    struct usleep_token tok = { .t = get_current() };
+    add_timer_us(usleep_cb, &tok, (uint64_t)usec);
+    thread_block();
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
  * @brief do_syscall() – Decode tf->a7 and dispatch to the handler.
  *
  * Unknown syscall numbers return -1 so user space can detect them.
@@ -401,6 +469,12 @@ long do_syscall(struct trap_frame *tf)
         sys_exit((long)tf->a0);       /* noreturn */
     case SYS_STOP:
         return sys_stop((long)tf->a0);
+    case SYS_DISPLAY:
+        return sys_display((unsigned int *)tf->a0,
+                           (unsigned int)tf->a1,
+                           (unsigned int)tf->a2);
+    case SYS_USLEEP:
+        return sys_usleep((unsigned int)tf->a0);
     default:
         return -1;
     }

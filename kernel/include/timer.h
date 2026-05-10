@@ -40,6 +40,16 @@ void timer_top_half(void);
 void add_timer(void (*callback)(void *), void *arg, int sec);
 
 /*
+ * add_timer_us() – One-shot callback fired @usec microseconds from now.
+ *
+ * Same behavior as add_timer() but accepts a sub-second resolution
+ * delay. Used by sys_usleep() to implement microsecond sleeps without
+ * busy-waiting. @usec == 0 still queues a node that fires at the next
+ * timer tick.
+ */
+void add_timer_us(void (*callback)(void *), void *arg, uint64_t usec);
+
+/*
  * Tick-conversion helpers – exposed so shell callbacks can translate
  * absolute ticks back into seconds for human-readable output.
  */
