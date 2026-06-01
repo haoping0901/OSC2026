@@ -19,6 +19,9 @@
 #define SYS_STOP        7
 #define SYS_DISPLAY     8
 #define SYS_USLEEP      9
+#define SYS_SIGNAL      10
+#define SYS_SIGRETURN   11
+#define SYS_KILL        12
 
 /** ----------------------------------------------------------------------
  * @brief do_syscall() – Top-level dispatcher for U-mode ecalls.

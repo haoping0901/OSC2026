@@ -12,6 +12,7 @@
 #include "types.h"
 #include "video.h"
 #include "timer.h"
+#include "signal.h"
 
 /*
  * Lab5 Basic Ex2 system-call layer.
@@ -160,6 +161,14 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     sie_restore(flags);
     kfree(old);
 
+    /* POSIX: exec resets handlers to default and drops pending. The
+     * sigstack is released defensively in case a previous handler had
+     * exec()'d (cannot legitimately happen via sigreturn, but cheap). */
+    for (int i = 0; i < NSIG; i++)
+        self->sig.handlers[i] = SIG_DFL;
+    self->sig.pending = 0;
+    signal_release(self);
+
     /* Rewrite the trap_frame so trap_return_user lands the new image. */
     tf->sepc = (uintptr_t)buf;
     tf->sp   = ((uintptr_t)buf + total) & ~0xFUL;
@@ -241,7 +250,17 @@ static long sys_fork(struct trap_frame *tf)
     ch->ctx.sp = (unsigned long)cf;
     ch->ctx.ra = (unsigned long)user_thread_bootstrap;
 
-    /* 5) Parent linkage + enqueue. */
+    /* 5) Inherit signal handler table from parent; pending/in_handler
+     *    do NOT cross the fork boundary (POSIX: child starts with an
+     *    empty pending set), and the sigstack belongs solely to the
+     *    parent's in-flight handler (if any). */
+    mem_cpy(&ch->sig.handlers, &par->sig.handlers,
+            sizeof(par->sig.handlers));
+    ch->sig.pending       = 0;
+    ch->sig.in_handler    = 0;
+    ch->sig.sigstack_base = NULL;
+
+    /* 6) Parent linkage + enqueue. */
     ch->parent = par;
     unsigned long flags = sie_save_clear();
     list_add_tail(&ch->sibling, &par->children);
@@ -330,6 +349,7 @@ static void sys_exit(long status)
         kfree(self->image_base);
         self->image_base = NULL;
     }
+    signal_release(self);
 
     if (par)
         thread_wakeup(par);
@@ -372,6 +392,7 @@ static long sys_stop(long pid)
         kfree(t->image_base);
         t->image_base = NULL;
     }
+    signal_release(t);
     if (par)
         thread_wakeup(par);
     return 0;
@@ -444,6 +465,63 @@ static long sys_usleep(unsigned int usec)
 }
 
 /** ----------------------------------------------------------------------
+ * @brief sys_signal() – Register a user-mode handler for @signum.
+ *
+ * Replaces self->sig.handlers[signum] and returns the previous slot
+ * value so userspace can chain handlers POSIX-style. SIG_DFL (NULL)
+ * and SIG_IGN are accepted as @handler. Validates @signum against
+ * the [1, NSIG) range; returns -1 otherwise.
+ * @param signum  Signal number to install for.
+ * @param handler User function pointer, or SIG_DFL / SIG_IGN.
+ * @return Previous handler pointer cast to long, or -1 on bad signum.
+ * -------------------------------------------------------------------- */
+static long sys_signal(int signum, void (*handler)(void))
+{
+    if (signum <= 0 || signum >= NSIG)
+        return -1;
+    struct thread *self = get_current();
+    void (*prev)(void) = self->sig.handlers[signum];
+    self->sig.handlers[signum] = handler;
+    return (long)(uintptr_t)prev;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_kill() – Post @signum to process @pid.
+ *
+ * Looks up the target via find_thread_by_pid(); refuses if the pid is
+ * not a live user process. Posting is asynchronous — delivery happens
+ * the next time the target is about to return to U-mode through
+ * signal_check_and_dispatch().
+ * @param pid    Target process id.
+ * @param signum Signal number in [1, NSIG).
+ * @return 0 on success, -1 if @pid does not exist or @signum is bad.
+ * -------------------------------------------------------------------- */
+static long sys_kill(int pid, int signum)
+{
+    if (signum <= 0 || signum >= NSIG)
+        return -1;
+    struct thread *t = find_thread_by_pid(pid);
+    if (!t || !t->image_base)
+        return -1;
+    signal_post(t, signum);
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_sigreturn() – SYS_SIGRETURN entry point.
+ *
+ * Thin wrapper around signal_return() that lives in syscall.c so
+ * do_syscall()'s switch can reach it. The heavy lifting (restoring
+ * the saved trap_frame and freeing the sigstack) is in signal.c.
+ * @param tf Live trap frame at trampoline ecall time.
+ * @return Original syscall return value to land in tf->a0.
+ * -------------------------------------------------------------------- */
+static long sys_sigreturn(struct trap_frame *tf)
+{
+    return signal_return(tf);
+}
+
+/** ----------------------------------------------------------------------
  * @brief do_syscall() – Decode tf->a7 and dispatch to the handler.
  *
  * Unknown syscall numbers return -1 so user space can detect them.
@@ -475,6 +553,12 @@ long do_syscall(struct trap_frame *tf)
                            (unsigned int)tf->a2);
     case SYS_USLEEP:
         return sys_usleep((unsigned int)tf->a0);
+    case SYS_SIGNAL:
+        return sys_signal((int)tf->a0, (void (*)(void))tf->a1);
+    case SYS_SIGRETURN:
+        return sys_sigreturn(tf);
+    case SYS_KILL:
+        return sys_kill((int)tf->a0, (int)tf->a1);
     default:
         return -1;
     }

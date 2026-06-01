@@ -8,6 +8,7 @@
 #include "types.h"
 #include "syscall.h"
 #include "sched.h"
+#include "signal.h"
 
 /* UART0 IRQ id (from DTB). Set via trap_set_uart_irq() before SEIE. */
 static unsigned int g_uart_irq;
@@ -31,6 +32,29 @@ static uintptr_t g_user_base = 0;
 void trap_set_user_base(uintptr_t base)
 {
     g_user_base = base;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief deliver_pending_signal() – Return-to-U gate for signal delivery.
+ *
+ * Called on every trap-handler exit path that will sret into U-mode.
+ * Restricts dispatch to user processes (image_base != NULL) so kernel
+ * threads, the bootstrap thread and the idle thread are skipped. If
+ * the default handler kills the current thread, we re-enter
+ * schedule() so the kernel never sret's into a dead user image; the
+ * call never returns from the dead thread's perspective.
+ * @param tf Trap frame about to be restored by trap_return_user.
+ * -------------------------------------------------------------------- */
+static void deliver_pending_signal(struct trap_frame *tf)
+{
+    struct thread *cur = get_current();
+    if (!cur || !cur->image_base)
+        return;
+
+    signal_check_and_dispatch(tf);
+
+    if (cur->state == THREAD_ZOMBIE)
+        schedule();
 }
 
 /** ----------------------------------------------------------------------
@@ -97,6 +121,12 @@ void trap_handler(struct trap_frame *tf)
         if (need_resched_clear()
             && (tf->sstatus & SSTATUS_SPP) == 0)
             schedule();
+
+        /* Signal dispatch only applies to U-mode-bound returns. SPP=0
+         * means the trap was taken from U and we will sret back to U
+         * after this. */
+        if ((tf->sstatus & SSTATUS_SPP) == 0)
+            deliver_pending_signal(tf);
         return;
     }
 
@@ -116,6 +146,10 @@ void trap_handler(struct trap_frame *tf)
 
         if (need_resched_clear())
             schedule();
+
+        /* ECALL_U always sret's back to U-mode; SPP is 0 here. Try to
+         * deliver one pending signal before resuming user code. */
+        deliver_pending_signal(tf);
         return;
     }
 

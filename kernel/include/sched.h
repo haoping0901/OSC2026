@@ -3,6 +3,7 @@
 
 #include "list.h"
 #include "types.h"
+#include "signal.h"
 
 /*
  * Cooperative kernel-thread scheduler (Lab5 Basic Ex1) extended with
@@ -79,6 +80,11 @@ struct thread {
     void             *image_base;
     unsigned long     image_size;
     unsigned long     total_size;
+
+    /* Per-thread POSIX signal state. Untouched for kernel-only threads
+     * (their pending bitmap stays 0 so signal_check_and_dispatch is a
+     * no-op even if it is ever reached on a non-user path). */
+    struct signal_state sig;
 };
 
 /* User stack size attached after every user image. */

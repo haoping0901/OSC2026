@@ -13,6 +13,7 @@
 #include "riscv.h"
 #include "list.h"
 #include "types.h"
+#include "signal.h"
 
 #define SHELL_BUF_SIZE 128
 
@@ -38,6 +39,7 @@ static void shell_print_help(void)
     uart_puts("  tasknest - nested priority dispatch demo (start -> inner -> end).\n");
     uart_puts("  threadtest - spawn 3 cooperative threads (Lab5 Basic Ex1).\n");
     uart_puts("  stop <pid> - forcibly terminate a user process (Lab5 Basic Ex2).\n");
+    uart_puts("  kill <pid> <signum> - post a POSIX signal to a user process.\n");
 }
 
 /* ---------- threadtest (Lab5 Basic Ex1: cooperative threads) ----------- */
@@ -277,6 +279,60 @@ static void shell_stop_pid(const char *args)
     uart_puts(" terminated\n");
 }
 
+/** ----------------------------------------------------------------------
+ * @brief shell_kill_pid() – Debug command: post a signal from the shell.
+ *
+ * Parses "kill <pid> <signum>" and calls signal_post() directly on the
+ * target. Bypasses sys_kill() because the shell runs in S-mode and
+ * cannot issue ecalls to itself; the effect on the target is identical.
+ * @param args Command tail after "kill ".
+ * -------------------------------------------------------------------- */
+static void shell_kill_pid(const char *args)
+{
+    const char *p = args;
+    int pid = 0;
+    int digits = 0;
+    int signum = 0;
+
+    while (*p == ' ')
+        p++;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || *p != ' ') {
+        uart_puts("usage: kill <pid> <signum>\n");
+        return;
+    }
+
+    while (*p == ' ')
+        p++;
+    digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        signum = signum * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || signum <= 0 || signum >= NSIG) {
+        uart_puts("usage: kill <pid> <signum>\n");
+        return;
+    }
+
+    struct thread *t = find_thread_by_pid(pid);
+    if (!t || !t->image_base) {
+        uart_puts("kill: pid not found\n");
+        return;
+    }
+
+    signal_post(t, signum);
+    uart_puts("[kill] posted signum=");
+    print_dec_ulong((unsigned long)signum);
+    uart_puts(" to pid=");
+    print_dec_ulong((unsigned long)pid);
+    uart_puts("\n");
+}
+
 /* ---------- Lab 3 test case --------------------------------------------- */
 
 static void test_alloc_1(void)
@@ -496,6 +552,10 @@ static void shell_handle_command(const char *cmd)
         shell_stop_pid(cmd + 5);
     } else if (str_eq(cmd, "stop") != 0) {
         uart_puts("usage: stop <pid>\n");
+    } else if (str_startswith(cmd, "kill ")) {
+        shell_kill_pid(cmd + 5);
+    } else if (str_eq(cmd, "kill") != 0) {
+        uart_puts("usage: kill <pid> <signum>\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);

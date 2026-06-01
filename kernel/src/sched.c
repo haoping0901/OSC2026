@@ -8,6 +8,7 @@
 #include "dtb.h"
 #include "uart.h"
 #include "utils.h"
+#include "signal.h"
 
 /*
  * Per-thread kernel stack size. 8 KiB exceeds MAX_CHUNK_SIZE so the
@@ -152,6 +153,7 @@ struct thread *thread_alloc_bare(void)
     INIT_LIST_HEAD(&t->link);
     INIT_LIST_HEAD(&t->children);
     INIT_LIST_HEAD(&t->sibling);
+    signal_state_init(&t->sig);
     return t;
 }
 
