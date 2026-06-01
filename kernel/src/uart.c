@@ -3,6 +3,7 @@
 #include "types.h"
 #include "task.h"
 #include "plic.h"
+#include "sched.h"
 
 /* Runtime UART base address – overridden by uart_set_base() after DTB parse */
 static volatile unsigned long g_uart_base;
@@ -292,8 +293,10 @@ int uart_getc(void)
     int c;
 
     if (g_uart_irq_mode) {
-        while (ring_empty(&rx_buf))
+        while (ring_empty(&rx_buf)) {
+            schedule();
             asm volatile ("wfi");
+        }
         c = ring_pop(&rx_buf);
     } else {
         c = uart_getc_raw();
@@ -329,8 +332,10 @@ void uart_putc(unsigned char c)
 
     if (g_uart_irq_mode) {
         /* Block (wfi) until the ISR has drained enough of tx_buf. */
-        while (ring_full(&tx_buf))
+        while (ring_full(&tx_buf)) {
+            schedule();
             asm volatile ("wfi");
+        }
 
         unsigned long sie = sie_save_clear();
         ring_push(&tx_buf, c);

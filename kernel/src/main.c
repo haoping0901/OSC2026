@@ -8,7 +8,9 @@
 #include "timer.h"
 #include "plic.h"
 #include "riscv.h"
+#include "sched.h"
 #include "utils.h"
+#include "video.h"
 
 /* Kernel image boundaries exported by the linker script. */
 extern char _kernel_start[];
@@ -166,7 +168,23 @@ int main(unsigned long hart_id, void *dtb_ptr)
     timer_init();
     uart_puts("[Timer] Core timer interrupt enabled.\n");
 
-    /* Step 14: Continue with the interactive shell. */
+    /* Step 13.5: Register the QEMU ramfb framebuffer (Lab5 Basic Ex3).
+     * Done after timer_init() so all earlier subsystems are live; if
+     * fw_cfg/ramfb is unavailable we just print a warning instead of
+     * panicking — boards without ramfb should keep booting normally. */
+    video_init();
+    uart_puts("[Video] ramfb registered at 0x");
+    print_hex_ulong((unsigned long)FB_BASE);
+    uart_puts(".\n");
+
+    /* Step 14: Adopt the boot context as the bootstrap thread and
+     * spawn the idle thread (Lab5 Basic Ex1). After this point any
+     * code running on the main path is "the bootstrap thread"; any
+     * future thread_create()/schedule() call composes correctly. */
+    sched_init();
+    uart_puts("[Sched] bootstrap + idle thread ready.\n");
+
+    /* Step 15: Continue with the interactive shell. */
     shell();
 
     return 0;

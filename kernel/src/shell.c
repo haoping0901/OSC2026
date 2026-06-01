@@ -8,9 +8,12 @@
 #include "trap.h"
 #include "timer.h"
 #include "task.h"
+#include "sched.h"
+#include "syscall.h"
+#include "riscv.h"
+#include "list.h"
 #include "types.h"
-
-#define USER_STACK_SIZE  (16 * 1024)  /* 16 KiB user stack for prog.bin */
+#include "signal.h"
 
 #define SHELL_BUF_SIZE 128
 
@@ -34,6 +37,36 @@ static void shell_print_help(void)
     uart_puts("  setTimeout <sec> <msg> - print msg after sec seconds.\n");
     uart_puts("  taskdemo - enqueue 3 tasks out of priority order.\n");
     uart_puts("  tasknest - nested priority dispatch demo (start -> inner -> end).\n");
+    uart_puts("  threadtest - spawn 3 cooperative threads (Lab5 Basic Ex1).\n");
+    uart_puts("  stop <pid> - forcibly terminate a user process (Lab5 Basic Ex2).\n");
+    uart_puts("  kill <pid> <signum> - post a POSIX signal to a user process.\n");
+}
+
+/* ---------- threadtest (Lab5 Basic Ex1: cooperative threads) ----------- */
+
+/** ----------------------------------------------------------------------
+ * @brief demo_thread_body() – Worker body for the threadtest demo.
+ *
+ * Loops five times: prints its own tid + iteration, busy-waits for a
+ * visible interval, then yields via schedule(). Returning naturally
+ * from this function falls through the trampoline into thread_exit(),
+ * which marks the thread zombie so the idle thread eventually reaps
+ * it. Output from three concurrent invocations should interleave
+ * round-robin, confirming the context switch works.
+ * -------------------------------------------------------------------- */
+static void demo_thread_body(void)
+{
+    int id = get_current()->tid;
+    for (int i = 0; i < 5; i++) {
+        uart_puts("Thread id: ");
+        print_dec_ulong((unsigned long)id);
+        uart_puts(" iter ");
+        print_dec_ulong((unsigned long)i);
+        uart_puts("\n");
+        for (volatile int j = 0; j < 1000000; j++)
+            ;
+        schedule();
+    }
 }
 
 /* ---------- taskdemo / tasknest (Advanced Ex2: bottom-half tasks) ------- */
@@ -167,54 +200,137 @@ static void shell_set_timeout(const char *args)
 }
 
 /** ----------------------------------------------------------------------
- * @brief run_user_program() – Load a file from initrd and drop into U-mode.
+ * @brief run_user_program() – Spawn a user process from an initrd file.
  *
- * Looks up @name inside the cpio archive, copies it into a fresh kmalloc
- * region sized for both the code and a 16 KiB user stack, then calls
- * enter_user_mode() which does not return. The shell regains control only
- * through a trap (printed by trap_handler) followed by sret back to the
- * program.
- * @param name Filename inside the initial ramdisk (e.g. "prog.bin").
+ * Hands the program off to thread_spawn_user(), which builds a kernel
+ * thread together with its trap_frame. The shell yields once so the
+ * new thread starts running; it later exits on its own and the idle
+ * thread reaps its kernel stack. Multiple `exec` invocations therefore
+ * coexist as concurrent user processes.
+ * @param name Filename inside the initial ramdisk.
  * -------------------------------------------------------------------- */
 static void run_user_program(const char *name)
 {
-    const void *initrd = (const void *)dtb_getprop("/chosen",
-                                                   "linux,initrd-start");
-    if (!initrd) {
-        uart_puts("exec: initrd not found\n");
-        return;
-    }
-
-    const void *src = NULL;
-    unsigned long src_size = 0;
-    if (cpio_find(initrd, name, &src, &src_size) != 0) {
-        uart_puts("exec: ");
+    struct thread *t = thread_spawn_user(name);
+    if (!t) {
+        uart_puts("exec: cannot start ");
         uart_puts(name);
-        uart_puts(": not found\n");
+        uart_puts("\n");
+        return;
+    }
+    /* Wait until the process has fully exited. sys_exit() wakes the
+     * parent (shell) explicitly before yielding. */
+    while (t->state != THREAD_ZOMBIE)
+        thread_block();
+
+    /* Reap the zombie so it doesn't linger in memory. */
+    unsigned long flags = sie_save_clear();
+    list_del(&t->sibling);
+    sie_restore(flags);
+    sched_zombify(t);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief shell_stop_pid() – Debug command: forcibly terminate a pid.
+ *
+ * Wraps sys_stop()'s logic for use from kernel context (without going
+ * through ecall). Useful for verifying §4.6 of the plan.
+ * @param args Command tail (decimal pid).
+ * -------------------------------------------------------------------- */
+static void shell_stop_pid(const char *args)
+{
+    const char *p = args;
+    while (*p == ' ')
+        p++;
+    int pid = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0) {
+        uart_puts("usage: stop <pid>\n");
         return;
     }
 
-    unsigned long total = src_size + USER_STACK_SIZE;
-    void *buf = kmalloc(total);
-    if (!buf) {
-        uart_puts("exec: out of memory\n");
+    struct thread *t = find_thread_by_pid(pid);
+    if (!t || !t->image_base) {
+        uart_puts("stop: pid not found\n");
         return;
     }
-    mem_cpy(buf, src, src_size);
 
-    uintptr_t entry   = (uintptr_t)buf;
-    uintptr_t user_sp = ((uintptr_t)buf + total) & ~0xfUL;
+    unsigned long flags = sie_save_clear();
+    t->exit_status = -1;
+    if (t->state == THREAD_READY)
+        list_del(&t->link);
+    t->state = THREAD_ZOMBIE;
+    struct thread *par = t->parent;
+    sie_restore(flags);
 
-    uart_puts("[exec] entry=0x");
-    print_hex_ulong(entry);
-    uart_puts(" sp=0x");
-    print_hex_ulong(user_sp);
-    uart_puts(" size=");
-    print_dec_ulong(src_size);
+    if (t->image_base) {
+        kfree(t->image_base);
+        t->image_base = NULL;
+    }
+    if (par)
+        thread_wakeup(par);
+    uart_puts("[stop] pid=");
+    print_dec_ulong((unsigned long)pid);
+    uart_puts(" terminated\n");
+}
+
+/** ----------------------------------------------------------------------
+ * @brief shell_kill_pid() – Debug command: post a signal from the shell.
+ *
+ * Parses "kill <pid> <signum>" and calls signal_post() directly on the
+ * target. Bypasses sys_kill() because the shell runs in S-mode and
+ * cannot issue ecalls to itself; the effect on the target is identical.
+ * @param args Command tail after "kill ".
+ * -------------------------------------------------------------------- */
+static void shell_kill_pid(const char *args)
+{
+    const char *p = args;
+    int pid = 0;
+    int digits = 0;
+    int signum = 0;
+
+    while (*p == ' ')
+        p++;
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || *p != ' ') {
+        uart_puts("usage: kill <pid> <signum>\n");
+        return;
+    }
+
+    while (*p == ' ')
+        p++;
+    digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        signum = signum * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0 || signum <= 0 || signum >= NSIG) {
+        uart_puts("usage: kill <pid> <signum>\n");
+        return;
+    }
+
+    struct thread *t = find_thread_by_pid(pid);
+    if (!t || !t->image_base) {
+        uart_puts("kill: pid not found\n");
+        return;
+    }
+
+    signal_post(t, signum);
+    uart_puts("[kill] posted signum=");
+    print_dec_ulong((unsigned long)signum);
+    uart_puts(" to pid=");
+    print_dec_ulong((unsigned long)pid);
     uart_puts("\n");
-
-    trap_set_user_base(entry);
-    enter_user_mode(entry, user_sp);
 }
 
 /* ---------- Lab 3 test case --------------------------------------------- */
@@ -419,6 +535,27 @@ static void shell_handle_command(const char *cmd)
          * the outer one finishes. */
         add_task(demo_task_slow, NULL, 9);
         task_run_pending();
+    } else if (str_eq(cmd, "threadtest") != 0) {
+        /* Spawn three worker threads and yield from the shell several
+         * times so they all get a turn. After every worker calls
+         * thread_exit() the run queue narrows back to just the
+         * bootstrap and idle threads, at which point schedule() lands
+         * us back here and the loop exits. The idle thread reaps the
+         * zombies on its own cycle. */
+        thread_create(demo_thread_body);
+        thread_create(demo_thread_body);
+        thread_create(demo_thread_body);
+        for (int i = 0; i < 20; i++)
+            schedule();
+        uart_puts("[threadtest] back in shell\n");
+    } else if (str_startswith(cmd, "stop ")) {
+        shell_stop_pid(cmd + 5);
+    } else if (str_eq(cmd, "stop") != 0) {
+        uart_puts("usage: stop <pid>\n");
+    } else if (str_startswith(cmd, "kill ")) {
+        shell_kill_pid(cmd + 5);
+    } else if (str_eq(cmd, "kill") != 0) {
+        uart_puts("usage: kill <pid> <signum>\n");
     } else if (*cmd != '\0') {
         uart_puts("Unknown command: ");
         uart_puts(cmd);

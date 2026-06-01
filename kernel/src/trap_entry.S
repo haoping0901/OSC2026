@@ -74,10 +74,29 @@ trap_entry:
     sd    t2, TF_SCAUSE(sp)
     sd    t3, TF_STVAL(sp)
 
+    /* Restore the kernel's tp (thread pointer) from the trap_frame
+     * so that get_current() inside trap_handler and do_syscall works
+     * even if the user program modified its own tp register. */
+    ld    tp, TF_TP(sp)
+
     /* Dispatch to C. */
     mv    a0, sp
     call  trap_handler
 
+    /*
+     * trap_return_user: shared U-mode return path.
+     *
+     * Entered either by falling through from trap_handler above, OR by
+     * thread_spawn_user() / sys_fork(): they plant a trap_frame on the
+     * new thread's kernel stack and set ctx.sp = &trap_frame,
+     * ctx.ra = user_thread_bootstrap. The first switch_to() then
+     * jumps here with sp already pointing at the prepared frame.
+     *
+     * DO NOT MOVE — sched.c and syscall.c (sys_fork) rely on this label
+     * being the first instruction of the U-mode restore sequence.
+     */
+.globl trap_return_user
+trap_return_user:
     /* Restore sepc / sstatus (scause / stval are read-only on return). */
     ld    t0, TF_SEPC(sp)
     ld    t1, TF_SSTATUS(sp)
@@ -267,3 +286,19 @@ enter_user_mode:
     li    t6, 0
 
     sret
+
+
+/* ------------------------------------------------------------------ */
+/* user_thread_bootstrap                                              */
+/*                                                                    */
+/* First-dispatch landing pad for user threads.                       */
+/* The scheduler's switch_to() arrives here with sp already pointing  */
+/* at a fully populated trap_frame (planted by thread_spawn_user() or */
+/* sys_fork() at the top of the new thread's kernel stack), so we     */
+/* simply hand off to the shared U-mode restore path.                 */
+/* ------------------------------------------------------------------ */
+.globl user_thread_bootstrap
+.align 2
+user_thread_bootstrap:
+    mv    a0, sp
+    j     trap_return_user

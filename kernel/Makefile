@@ -21,7 +21,7 @@ SRC_DIR   = src
 BUILD_DIR = build/$(PLATFORM)
 TARGET    = kernel
 
-CFLAGS  = -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
+CFLAGS  = -march=rv64gc_zifencei_zicbom -mabi=lp64d -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
 LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) --no-warn-rwx-segments
 
 # Source files and corresponding object files
@@ -62,7 +62,7 @@ $(TARGET).fit: $(TARGET).bin initramfs.cpio
 
 # Run the kernel in QEMU
 QEMU = qemu-system-riscv64
-QEMU_OPTS = -M virt -m 8G -display none -serial stdio
+QEMU_OPTS = -M virt -m 8G -serial stdio -vga none -device ramfb
 
 rootfs/hello.txt:
 	mkdir -p rootfs
@@ -74,7 +74,12 @@ rootfs/prog.bin: prog.bin
 	mkdir -p rootfs
 	cp prog.bin rootfs/prog.bin
 
-initramfs.cpio: rootfs/hello.txt rootfs/prog.bin
+# Lab5 Basic Ex2 fork_test binary, supplied by the course.
+rootfs/osctest.bin: osctest.bin
+	mkdir -p rootfs
+	cp osctest.bin rootfs/osctest.bin
+
+initramfs.cpio: rootfs/hello.txt rootfs/prog.bin rootfs/osctest.bin
 	cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio
 
 test: qemu initramfs.cpio
