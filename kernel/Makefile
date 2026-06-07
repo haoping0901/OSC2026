@@ -8,12 +8,20 @@ MKIMAGE = mkimage
 # Default platform is qemu, can switch to opi with make PLATFORM=opi
 PLATFORM ?= qemu
 
+# Lab6: the kernel is linked at a higher-half virtual address. The load
+# address (LMA, where QEMU actually places kernel.bin) stays the physical
+# RAM offset; the linker script relocates symbols to VMA = LMA + the linear
+# map offset. KERNEL_VA_OFFSET must equal mm.h's KERNEL_VA_OFFSET.
+KERNEL_VA_OFFSET = 0xffffffc000000000
+
 ifeq ($(PLATFORM), qemu)
-    KERNEL_BASE = 0x80200000
+    KERNEL_LMA  = 0x80200000
+    KERNEL_BASE = 0xffffffc080200000
     PLAT_CFLAGS = -DQEMU
 else ifeq ($(PLATFORM), opi)
-    KERNEL_BASE = 0x00200000
-    PLAT_CFLAGS = 
+    KERNEL_LMA  = 0x00200000
+    KERNEL_BASE = 0xffffffc000200000
+    PLAT_CFLAGS =
 endif
 
 # Set paths
@@ -22,7 +30,8 @@ BUILD_DIR = build/$(PLATFORM)
 TARGET    = kernel
 
 CFLAGS  = -march=rv64gc_zifencei_zicbom -mabi=lp64d -mcmodel=medany -ffreestanding -nostdlib -g -Wall -I include $(PLAT_CFLAGS)
-LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) --no-warn-rwx-segments
+LDFLAGS = -T $(SRC_DIR)/linker.ld -defsym KERNEL_BASE=$(KERNEL_BASE) \
+          -defsym KERNEL_LMA=$(KERNEL_LMA) --no-warn-rwx-segments
 
 # Source files and corresponding object files
 C_SRCS := $(wildcard $(SRC_DIR)/*.c)

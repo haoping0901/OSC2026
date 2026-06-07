@@ -1,6 +1,54 @@
 #ifndef __RISCV_H__
 #define __RISCV_H__
 
+/* ---------- Sv39 paging: satp / PTE ------------------------------------- */
+
+/* satp MODE field: 8 selects Sv39 (three-level, 39-bit VA). */
+#define SATP_SV39           (8UL << 60)
+
+/* Build a satp value: MODE=Sv39, ASID=0, PPN = root page table PA >> 12. */
+#define MAKE_SATP(pgd_pa)   (SATP_SV39 | ((unsigned long)(pgd_pa) >> 12))
+
+/* PTE permission / status flag bits. */
+#define PTE_V   (1UL << 0)   /* Valid                                     */
+#define PTE_R   (1UL << 1)   /* Readable                                  */
+#define PTE_W   (1UL << 2)   /* Writable                                  */
+#define PTE_X   (1UL << 3)   /* Executable                                */
+#define PTE_U   (1UL << 4)   /* User-accessible                           */
+#define PTE_G   (1UL << 5)   /* Global mapping                            */
+#define PTE_A   (1UL << 6)   /* Accessed                                  */
+#define PTE_D   (1UL << 7)   /* Dirty                                     */
+
+/* Common leaf permission sets for the kernel linear map. */
+#define PROT_KERNEL  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D)
+#define PROT_DEVICE  (PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D)
+
+/*
+ * Sv39 page-table walk shifts. A 39-bit VA splits into three 9-bit VPN
+ * fields plus a 12-bit page offset:
+ *   VPN[2] = bits 38..30   (PGD index, 1 GiB stride)
+ *   VPN[1] = bits 29..21   (PMD index, 2 MiB stride)
+ *   VPN[0] = bits 20..12   (PTE index, 4 KiB stride)
+ */
+#define PGD_SHIFT   30
+#define PMD_SHIFT   21
+#define PTE_SHIFT   12
+#define PTRS_PER_TABLE   512   /* entries per page table (4 KiB / 8 B)   */
+
+/* Stride in bytes covered by one entry at each level. */
+#define PGD_SIZE    (1UL << PGD_SHIFT)   /* 1 GiB                          */
+#define PMD_SIZE    (1UL << PMD_SHIFT)   /* 2 MiB                          */
+
+/*
+ * Compose a PTE from a physical address and flag bits.
+ * PPN occupies bits [53:10], i.e. (PA >> 12) << 10.
+ */
+#define MAKE_PTE(pa, flags) \
+    ((((unsigned long)(pa) >> 12) << 10) | (unsigned long)(flags))
+
+/* Extract the next-level table PA from a non-leaf PTE. */
+#define PTE_TO_PA(pte)   ((((unsigned long)(pte) >> 10) << 12))
+
 /* ---------- sstatus bits ------------------------------------------------ */
 #define SSTATUS_SIE   (1UL << 1)   /* S-mode interrupt enable            */
 #define SSTATUS_SPIE  (1UL << 5)   /* previous SIE before trap           */

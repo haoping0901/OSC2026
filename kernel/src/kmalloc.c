@@ -2,6 +2,7 @@
 #include "buddy.h"
 #include "uart.h"
 #include "utils.h"
+#include "mm.h"
 
 /* ===== Pool definitions =================================================
  *
@@ -56,10 +57,15 @@ static int find_pool(unsigned long size)
     return -1;  /* too large for any pool */
 }
 
-/** Convert a physical address to a page-frame index (relative to buddy base). */
-static inline unsigned long addr_to_page_idx(uintptr_t addr)
+/**
+ * Convert a buddy pointer to a page-frame index (relative to buddy base).
+ *
+ * Buddy hands out linear-map VAs while its base is a PA, so map the VA back
+ * to a PA before computing the frame index (Lab6 higher-half paging).
+ */
+static inline unsigned long ptr_to_page_idx(void *ptr)
 {
-    return (addr - buddy_get_base()) / PAGE_SIZE;
+    return (virt_to_phys(ptr) - buddy_get_base()) / PAGE_SIZE;
 }
 
 /* ===== Public API ======================================================= */
@@ -95,7 +101,7 @@ void *kmalloc(unsigned long size)
         if (ptr) {
             /* Mark all pages covered by this allocation as -1 (large). */
             unsigned long pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-            unsigned long base  = addr_to_page_idx((uintptr_t)ptr);
+            unsigned long base  = ptr_to_page_idx(ptr);
             for (unsigned long i = 0; i < pages; i++)
                 page_pool_idx[base + i] = -1;
         }
@@ -111,7 +117,7 @@ void *kmalloc(unsigned long size)
         if (!page)
             return NULL;
 
-        unsigned long pg_idx = addr_to_page_idx((uintptr_t)page);
+        unsigned long pg_idx = ptr_to_page_idx(page);
         page_pool_idx[pg_idx] = (signed char)pidx;
 
         /* Slice the page into chunks and push onto the free list. */
@@ -137,11 +143,9 @@ void kfree(void *ptr)
     if (!ptr)
         return;
 
-    uintptr_t addr = (uintptr_t)ptr;
-
-    /* Find the page this pointer lives in. */
-    uintptr_t page_base = addr & ~(PAGE_SIZE - 1);
-    unsigned long pg_idx = addr_to_page_idx(page_base);
+    /* Find the page this pointer lives in (page-aligned VA). */
+    void *page_base = (void *)((uintptr_t)ptr & ~(PAGE_SIZE - 1));
+    unsigned long pg_idx = ptr_to_page_idx(page_base);
 
     signed char pidx = page_pool_idx[pg_idx];
 

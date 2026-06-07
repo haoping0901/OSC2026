@@ -11,6 +11,7 @@
 #include "sched.h"
 #include "utils.h"
 #include "video.h"
+#include "mm.h"
 
 /* Kernel image boundaries exported by the linker script. */
 extern char _kernel_start[];
@@ -27,8 +28,15 @@ static void reserve_startup_region(uintptr_t base, uintptr_t size)
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
-    /* Step 1: Register the DTB address so the parser can use it. */
-    dtb_set_addr(dtb_ptr);
+    /* Lab6: start.S hands us physical addresses (DTB pointer in a1, device
+     * bases resolved from the DTB are PAs). Paging is on and the kernel runs
+     * in the higher half, so every PA we dereference or feed to a driver is
+     * routed through phys_to_virt() here — keeping the PA->VA boundary in
+     * main.c. Buddy bookkeeping intentionally stays in PA (see buddy.c). */
+    uintptr_t dtb_pa = (uintptr_t)dtb_ptr;
+
+    /* Step 1: Register the DTB address (as a VA) so the parser can read it. */
+    dtb_set_addr(phys_to_virt(dtb_pa));
 
     /* Step 2: Resolve UART base address from the devicetree.
      *
@@ -38,12 +46,12 @@ int main(unsigned long hart_id, void *dtb_ptr)
      * Both boards use the same logical path; node_name_match() in dtb.c
      * handles the "@<unit-addr>" suffix transparently.
      */
-    uintptr_t u_base = dtb_getprop("/soc/serial", "reg");
-    uart_set_base(u_base);
+    uintptr_t u_base_pa = dtb_getprop("/soc/serial", "reg");
+    uart_set_base((unsigned long)phys_to_virt(u_base_pa));
 
     uart_puts("Welcome to OPI-RV2!\n");
-    uart_puts("Uart base address: 0x");
-    print_hex_ulong(u_base);
+    uart_puts("Uart base address (PA): 0x");
+    print_hex_ulong(u_base_pa);
     uart_puts("\n");
 
     /* Step 3: Retrieve the first usable memory region from the DTB
@@ -69,20 +77,25 @@ int main(unsigned long hart_id, void *dtb_ptr)
 
     /* 5-a: DTB blob */
     uintptr_t dtb_size = dtb_get_totalsize();
-    uart_puts("[DTB] Address: 0x");
-    print_hex_ulong((uintptr_t)dtb_ptr);
+    uart_puts("[DTB] Address (PA): 0x");
+    print_hex_ulong(dtb_pa);
     uart_puts(" Size: 0x");
     print_hex_ulong(dtb_size);
     uart_puts("\n");
-    buddy_startup_reserve((uintptr_t)dtb_ptr, (uintptr_t)dtb_ptr + dtb_size);
+    /* DTB pointer is already a PA; buddy reserves in PA. */
+    buddy_startup_reserve(dtb_pa, dtb_pa + dtb_size);
 
-    /* 5-b: Kernel image (text + rodata + data + bss + stack) */
-    uart_puts("[Kernel] Address: 0x");
-    print_hex_ulong((uintptr_t)_kernel_start);
+    /* 5-b: Kernel image (text + rodata + data + bss + stack).
+     * _kernel_start/_kernel_end are higher-half VAs (linker VMA); convert
+     * back to PA so the reserve lands on the right physical frames. */
+    uintptr_t kern_start_pa = virt_to_phys(_kernel_start);
+    uintptr_t kern_end_pa   = virt_to_phys(_kernel_end);
+    uart_puts("[Kernel] Address (PA): 0x");
+    print_hex_ulong(kern_start_pa);
     uart_puts(" - 0x");
-    print_hex_ulong((uintptr_t)_kernel_end);
+    print_hex_ulong(kern_end_pa);
     uart_puts("\n");
-    buddy_startup_reserve((uintptr_t)_kernel_start, (uintptr_t)_kernel_end);
+    buddy_startup_reserve(kern_start_pa, kern_end_pa);
 
     /* 5-c: Initramfs — present only when a bootloader passes it via /chosen */
     uintptr_t initrd_start = dtb_getprop("/chosen", "linux,initrd-start");
@@ -140,11 +153,14 @@ int main(unsigned long hart_id, void *dtb_ptr)
      * "plic@..." while the OrangePi RV2 DTS labels it
      * "interrupt-controller@...". Both still live under /soc. */
 #ifdef QEMU
-    uintptr_t plic_base = dtb_getprop("/soc/plic", "reg");
+    uintptr_t plic_base_pa = dtb_getprop("/soc/plic", "reg");
 #else
-    uintptr_t plic_base = dtb_getprop("/soc/interrupt-controller",
+    uintptr_t plic_base_pa = dtb_getprop("/soc/interrupt-controller",
                                      "reg");
-#endif
+#endif /* QEMU */
+
+    /* PLIC base from DTB is a PA; drive the controller via its VA. */
+    uintptr_t plic_base = (uintptr_t)phys_to_virt(plic_base_pa);
     unsigned int uart_irq = (unsigned int)dtb_getprop("/soc/serial",
                                                      "interrupts");
 
@@ -173,7 +189,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
      * fw_cfg/ramfb is unavailable we just print a warning instead of
      * panicking — boards without ramfb should keep booting normally. */
     video_init();
-    uart_puts("[Video] ramfb registered at 0x");
+    uart_puts("[Video] ramfb registered at PA 0x");
     print_hex_ulong((unsigned long)FB_BASE);
     uart_puts(".\n");
 

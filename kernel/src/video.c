@@ -20,6 +20,7 @@
 #include "video.h"
 #include "utils.h"
 #include "uart.h"
+#include "mm.h"
 
 #define XRGB8888  875713112
 
@@ -56,10 +57,15 @@ struct QEMU_PACKED RAMFBCfg {
     uint32_t stride;
 };
 
+/*
+ * fw_cfg lives in the MMIO aperture below the RAM base. After Lab6 paging
+ * the kernel runs in the higher half, so these registers must be reached
+ * through their linear-map VAs (phys_to_virt), not their raw PAs.
+ */
 #define FW_CFG_BASE   0x10100000UL
-#define FW_CFG_SELECT (uint16_t *)(FW_CFG_BASE + 0x08)
-#define FW_CFG_DATA   (uint64_t *)(FW_CFG_BASE + 0x00)
-#define FW_CFG_DMA    (uint64_t *)(FW_CFG_BASE + 0x10)
+#define FW_CFG_SELECT ((uint16_t *)phys_to_virt(FW_CFG_BASE + 0x08))
+#define FW_CFG_DATA   ((uint64_t *)phys_to_virt(FW_CFG_BASE + 0x00))
+#define FW_CFG_DMA    ((uint64_t *)phys_to_virt(FW_CFG_BASE + 0x10))
 
 #define FW_CFG_DMA_CTL_ERROR  0x01
 #define FW_CFG_DMA_CTL_READ   0x02
@@ -119,6 +125,10 @@ static int mem_ncmp(const char *a, const char *b, int n)
  * control field clearing. The device flips control to 0 on success or
  * sets the error bit on failure; we ignore the error bit and let the
  * caller observe by re-reading the destination buffer.
+ * QEMU dereferences the descriptor and the data buffer as guest-physical
+ * addresses, so both the buffer and the on-stack descriptor are converted
+ * from their kernel VAs back to PAs (Lab6 higher-half paging) before being
+ * handed to the device.
  * @param address User buffer (read into / written from).
  * @param length  Bytes to transfer.
  * @param control fw_cfg control word (already in host byte order).
@@ -129,9 +139,9 @@ static void fw_cfg_dma_transfer(void *address, uint32_t length,
     struct FWCfgDmaAccess access = {
         .control = bswap32(control),
         .length  = bswap32(length),
-        .address = bswap64((uint64_t)address),
+        .address = bswap64((uint64_t)virt_to_phys(address)),
     };
-    *FW_CFG_DMA = bswap64((uint64_t)&access);
+    *FW_CFG_DMA = bswap64((uint64_t)virt_to_phys(&access));
     while (bswap32(access.control) & ~FW_CFG_DMA_CTL_ERROR)
         ;
 }
@@ -261,7 +271,9 @@ void video_init(void)
  * -------------------------------------------------------------------- */
 void video_bmp_display(unsigned int *bmp_image, int width, int height)
 {
-    unsigned int *fb = (unsigned int *)FB_BASE;
+    /* FB_BASE is the guest-physical aperture handed to QEMU in video_init();
+     * the kernel writes pixels through its linear-map VA (Lab6 paging). */
+    unsigned int *fb = (unsigned int *)phys_to_virt(FB_BASE);
     int start_x = (FB_WIDTH - width) / 2;
     int start_y = (FB_HEIGHT - height) / 2;
     for (int y = 0; y < height; y++) {

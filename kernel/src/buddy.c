@@ -3,6 +3,7 @@
 #include "uart.h"
 #include "utils.h"
 #include "types.h"
+#include "mm.h"
 
 /*
  * Compile-time switch for the noisy per-page trace lines prefixed with
@@ -51,19 +52,43 @@ static inline unsigned long addr_to_idx(uintptr_t addr)
     return (addr - g_buddy_base) / PAGE_SIZE;
 }
 
+/*
+ * PA <-> pointer bridge (Lab6 higher-half paging).
+ *
+ * The buddy allocator keeps ALL of its bookkeeping in physical addresses
+ * (idx_to_addr/addr_to_idx, g_buddy_base/end, reserves), preserving each
+ * frame's PA identity. Once paging is on, however, a PA cannot be
+ * dereferenced directly — only its linear-map VA can. These two helpers
+ * are the only places buddy.c converts: a PA becomes a usable pointer when
+ * we touch in-page memory or hand a block to a caller, and a caller's
+ * pointer becomes a PA again on the way back in.
+ */
+static inline void *frame_pa_to_ptr(uintptr_t pa)
+{
+    return phys_to_virt(pa);
+}
+
+static inline uintptr_t frame_ptr_to_pa(void *p)
+{
+    return virt_to_phys(p);
+}
+
 /**
  * Get the list_head pointer that lives at the start of a free page.
  * Only valid when the page is free and is a block head.
+ *
+ * The free-list node is stored inside the page itself, so it must be
+ * accessed through the page's linear-map VA, not its raw PA.
  */
 static inline struct list_head *frame_list_head(unsigned long idx)
 {
-    return (struct list_head *)idx_to_addr(idx);
+    return (struct list_head *)frame_pa_to_ptr(idx_to_addr(idx));
 }
 
 /** Recover the frame index from a list_head that lives in a free page. */
 static inline unsigned long list_head_to_idx(struct list_head *lh)
 {
-    return addr_to_idx((uintptr_t)lh);
+    return addr_to_idx(frame_ptr_to_pa(lh));
 }
 
 /**
@@ -317,8 +342,8 @@ void *buddy_alloc(unsigned long size)
     for (unsigned long i = 0; i < alloc_pages; i++)
         frame_array[idx + i] = ALLOC_TAG(idx, target_order);
 
-    uintptr_t addr = idx_to_addr(idx);
-    return (void *)addr;
+    /* Return a dereferenceable VA; internal bookkeeping stays in PA. */
+    return frame_pa_to_ptr(idx_to_addr(idx));
 }
 
 void buddy_free(void *ptr)
@@ -326,7 +351,9 @@ void buddy_free(void *ptr)
     if (!ptr)
         return;
 
-    uintptr_t addr = (uintptr_t)ptr;
+    /* Caller hands back the VA we returned from buddy_alloc(); convert it
+     * to a PA to resume PA-based bookkeeping. */
+    uintptr_t addr = frame_ptr_to_pa(ptr);
     if (addr < g_buddy_base || addr >= g_buddy_end)
         return;
 
@@ -528,7 +555,10 @@ void *buddy_startup_alloc(unsigned long size)
     uart_puts(" size=0x");
     print_hex_ulong(size);
     uart_puts("\n");
-    return (void *)ret;
+
+    /* ret is a PA; hand the caller a dereferenceable linear-map VA so the
+     * metadata arrays (frame_array, page_pool_idx) can be indexed directly. */
+    return frame_pa_to_ptr(ret);
 }
 
 void buddy_startup_replay_reserves(void)

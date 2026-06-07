@@ -14,6 +14,7 @@
 #include "list.h"
 #include "types.h"
 #include "signal.h"
+#include "mm.h"
 
 #define SHELL_BUF_SIZE 128
 
@@ -486,7 +487,11 @@ static void shell_handle_command(const char *cmd)
     } else if (str_eq(cmd, "test") != 0) {
         test_alloc_1();
     } else if (str_eq(cmd, "ls") != 0) {
-        cpio_ls((void *)dtb_getprop("/chosen", "linux,initrd-start"));
+        /* initrd-start is a PA from the DTB; under paging we must deref
+         * via its higher-half VA, mirroring how main.c handles every
+         * other DTB-derived PA. */
+        uintptr_t initrd_pa = dtb_getprop("/chosen", "linux,initrd-start");
+        cpio_ls(initrd_pa ? phys_to_virt(initrd_pa) : 0);
     } else if (str_startswith(cmd, "cat ")) {
         const char *filename = cmd + 4;
         /* skip leading spaces */
@@ -496,7 +501,9 @@ static void shell_handle_command(const char *cmd)
         if (*filename == '\0') {
             uart_puts("usage: cat <filename>\n");
         } else {
-            cpio_cat((void *)dtb_getprop("/chosen", "linux,initrd-start"), filename);
+            uintptr_t initrd_pa =
+                dtb_getprop("/chosen", "linux,initrd-start");
+            cpio_cat(initrd_pa ? phys_to_virt(initrd_pa) : 0, filename);
         }
     } else if (str_eq(cmd, "cat") != 0) {
         uart_puts("usage: cat <filename>\n");

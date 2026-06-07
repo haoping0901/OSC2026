@@ -13,6 +13,7 @@
 #include "video.h"
 #include "timer.h"
 #include "signal.h"
+#include "mm.h"
 
 /*
  * Lab5 Basic Ex2 system-call layer.
@@ -135,8 +136,9 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     if (!self->image_base)
         return -1;
 
-    const void *initrd = (const void *)
-        dtb_getprop("/chosen", "linux,initrd-start");
+    /* initrd-start is a PA; under paging deref it through its VA. */
+    uintptr_t initrd_pa = dtb_getprop("/chosen", "linux,initrd-start");
+    const void *initrd = initrd_pa ? phys_to_virt(initrd_pa) : 0;
     const void   *src;
     unsigned long sz;
     if (!initrd || cpio_find(initrd, path, &src, &sz) != 0)
