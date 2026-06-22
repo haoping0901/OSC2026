@@ -181,3 +181,175 @@ void drop_identity_map(void)
 
     asm volatile ("sfence.vma zero, zero" ::: "memory");
 }
+
+/* ---------- Lab6 Basic Ex2: per-process address spaces ----------------- */
+
+/** ----------------------------------------------------------------------
+ * @brief kernel_pgd() – Expose the static kernel root page table.
+ *
+ * The kernel PGD lives in .data (built by setup_vm()); pgd_alloc()
+ * clones its high half into every user PGD, and the scheduler installs
+ * it when dispatching a kernel-only thread.
+ * @return Kernel VA of the kernel root page table.
+ * -------------------------------------------------------------------- */
+unsigned long *kernel_pgd(void)
+{
+    return pgd;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief zero_page() – Clear one 4 KiB page word by word.
+ *
+ * Freestanding replacement for memset(0) on a freshly buddy_alloc'd
+ * page-table page. @p must be PAGE_SIZE aligned and PAGE_SIZE long.
+ * @param p Page to clear.
+ * -------------------------------------------------------------------- */
+static void zero_page(void *p)
+{
+    unsigned long *w = p;
+    for (unsigned long i = 0; i < PAGE_SIZE / sizeof(unsigned long); i++)
+        w[i] = 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief pgd_alloc() – Allocate a user root page table.
+ *
+ * Carves one zeroed 4 KiB page from the buddy allocator and copies the
+ * kernel high-half PGD entries (KERNEL_PGD_HALF..PTRS_PER_TABLE-1) into
+ * it. Those entries reference the SAME kernel PMD tables as the kernel
+ * PGD, so kernel code/stack/linear-map resolve identically in the new
+ * address space — the invariant that makes a satp switch safe.
+ * @return Kernel VA of the new PGD, or NULL on OOM.
+ * -------------------------------------------------------------------- */
+unsigned long *pgd_alloc(void)
+{
+    unsigned long *p = buddy_alloc(PAGE_SIZE);
+    if (!p)
+        return NULL;
+    zero_page(p);
+
+    unsigned long *kpgd = kernel_pgd();
+    for (int i = KERNEL_PGD_HALF; i < PTRS_PER_TABLE; i++)
+        p[i] = kpgd[i];        /* share kernel high-half PMD tables */
+
+    return p;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief walk_or_create() – Resolve one level, allocating a table.
+ *
+ * If @table[idx] already holds a valid non-leaf PTE, returns the kernel
+ * VA of the next-level table it points at. Otherwise allocates and
+ * zeroes a new table, links it as a pointer PTE (V only, R=W=X=0), and
+ * returns it. Tables live in the linear map, so PA<->VA uses
+ * phys_to_virt()/virt_to_phys().
+ * @param table Current-level table (kernel VA).
+ * @param idx   Entry index within @table.
+ * @return Kernel VA of the next-level table, or NULL on OOM.
+ * -------------------------------------------------------------------- */
+static unsigned long *walk_or_create(unsigned long *table, unsigned long idx)
+{
+    unsigned long pte = table[idx];
+    if (pte & PTE_V)
+        return phys_to_virt(PTE_TO_PA(pte));
+
+    unsigned long *next = buddy_alloc(PAGE_SIZE);
+    if (!next)
+        return NULL;
+    zero_page(next);
+    table[idx] = MAKE_PTE(virt_to_phys(next), PTE_V);
+    return next;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief map_pages() – Install 4 KiB leaf mappings, building tables.
+ *
+ * Iterates over [va, va+size) one page at a time, walking PGD->PMD->PTE
+ * (allocating intermediate tables on demand) and writing each leaf PTE
+ * with PPN = pa>>12 and flags @prot. Inputs must be PAGE_SIZE aligned.
+ * On OOM the partial mapping is left in place; the caller tears the
+ * whole address space down via uvm_destroy().
+ * @param pgd  Root page table (kernel VA).
+ * @param va   Virtual base (PAGE_SIZE aligned).
+ * @param size Byte length (PAGE_SIZE aligned).
+ * @param pa   Physical base (PAGE_SIZE aligned).
+ * @param prot Leaf PTE flag bits (must include PTE_V).
+ * @return 0 on success, -1 on OOM.
+ * -------------------------------------------------------------------- */
+int map_pages(unsigned long *pgd, unsigned long va, unsigned long size,
+              unsigned long pa, unsigned long prot)
+{
+    for (unsigned long off = 0; off < size; off += PAGE_SIZE) {
+        unsigned long v = va + off;
+
+        unsigned long *pmd = walk_or_create(pgd, PT_INDEX(v, 2));
+        if (!pmd)
+            return -1;
+        unsigned long *pte = walk_or_create(pmd, PT_INDEX(v, 1));
+        if (!pte)
+            return -1;
+
+        pte[PT_INDEX(v, 0)] = MAKE_PTE(pa + off, prot);
+    }
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uvm_destroy() – Free the user-half intermediate page tables.
+ *
+ * Walks the low half (PGD indices 0..KERNEL_PGD_HALF-1): for each valid
+ * PGD entry frees its PMD table after freeing every valid PMD entry's
+ * PTE table. Leaf user frames are owned and freed by the thread's
+ * image/stack bookkeeping, so they are deliberately not freed here. The
+ * shared kernel high half (>= KERNEL_PGD_HALF) is never touched.
+ * @param pgd Root page table whose user half is to be freed.
+ * -------------------------------------------------------------------- */
+void uvm_destroy(unsigned long *pgd)
+{
+    for (int i = 0; i < KERNEL_PGD_HALF; i++) {
+        if (!(pgd[i] & PTE_V))
+            continue;
+        unsigned long *pmd = phys_to_virt(PTE_TO_PA(pgd[i]));
+
+        for (int j = 0; j < PTRS_PER_TABLE; j++) {
+            if (!(pmd[j] & PTE_V))
+                continue;
+            unsigned long *pte = phys_to_virt(PTE_TO_PA(pmd[j]));
+            buddy_free(pte);
+        }
+        buddy_free(pmd);
+        pgd[i] = 0;
+    }
+}
+
+/** ----------------------------------------------------------------------
+ * @brief pgd_free() – Destroy a user address space and its root table.
+ *
+ * Frees the user-half tables via uvm_destroy() then returns the PGD
+ * page to the buddy allocator. Caller must ensure satp no longer points
+ * at @pgd (see the reap-point reclamation in sched.c).
+ * @param pgd Root page table to free.
+ * -------------------------------------------------------------------- */
+void pgd_free(unsigned long *pgd)
+{
+    uvm_destroy(pgd);
+    buddy_free(pgd);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief mm_set_satp() – Switch the active address space.
+ *
+ * Computes the PGD physical address, writes satp (MODE=Sv39) and issues
+ * sfence.vma to drop stale TLB entries. The kernel high half is
+ * identical across all PGDs, so the currently executing kernel code and
+ * stack remain valid across the switch.
+ * @param pgd_va Kernel VA of the PGD to install.
+ * -------------------------------------------------------------------- */
+void mm_set_satp(unsigned long *pgd_va)
+{
+    unsigned long pa = virt_to_phys(pgd_va);
+    asm volatile (
+        "csrw satp, %0\n"
+        "sfence.vma zero, zero\n"
+        :: "r"(MAKE_SATP(pa)) : "memory");
+}

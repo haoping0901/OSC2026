@@ -27,36 +27,36 @@
  */
 
 /** ----------------------------------------------------------------------
- * @brief in_user_range() – Best-effort user-pointer validation.
+ * @brief in_user_range() – User-pointer validation against the VA layout.
  *
- * Without an MMU there is no hardware enforcement; instead we check
- * that [p, p+n) lies inside the contiguous image+stack buffer that
- * thread_spawn_user() / sys_fork() allocated for the current thread.
- * Catches obvious out-of-range arguments before they fault the
- * kernel. Treats overflow as failure.
+ * With per-process paging (Lab6 Ex2) every process sees the same fixed
+ * user VAs: the image at [USER_CODE_VA, image_top) and the stack at
+ * [stack_lo, USER_STACK_TOP). A valid user buffer must lie wholly inside
+ * one of those two mapped intervals. This both rejects stray kernel/MMIO
+ * pointers and keeps the kernel from dereferencing an unmapped user VA
+ * (which would page-fault in S-mode). Treats overflow as failure.
  * @param p Start of the user buffer.
  * @param n Size in bytes.
- * @return 1 if the range is wholly inside the current image, else 0.
+ * @return 1 if the range is wholly inside a mapped user region, else 0.
  * -------------------------------------------------------------------- */
 static int in_user_range(const void *p, unsigned long n)
 {
-    /* Without an MMU, Non-PIC user binaries may access strings using
-     * absolute addresses from the parent image. To support this, we
-     * relax the check to allow any address that is not in the low 
-     * kernel memory or sensitive hardware ranges. */
+    struct thread *cur = get_current();
     uintptr_t a = (uintptr_t)p;
     uintptr_t e = a + n;
-    
-    if (e < a)
-        return 0;
-    
-    /* DRAM check using buddy allocator boundaries to stay board-agnostic. */
-    uintptr_t dram_base = buddy_get_base();
-    uintptr_t dram_end  = dram_base + buddy_get_total_pages() * PAGE_SIZE;
 
-    if (a >= dram_base && e <= dram_end)
+    if (e < a)                          /* overflow */
+        return 0;
+    if (!cur->pgd)                      /* not a user process */
+        return 0;
+
+    uintptr_t image_top = USER_CODE_VA + cur->image_pages;
+    uintptr_t stack_lo  = USER_STACK_TOP - cur->user_stack_size;
+
+    if (a >= USER_CODE_VA && e <= image_top)
         return 1;
-        
+    if (a >= stack_lo && e <= USER_STACK_TOP)
+        return 1;
     return 0;
 }
 
@@ -133,7 +133,7 @@ static long sys_uart_write(const char *buf, long count)
 static long sys_exec(const char *path, struct trap_frame *tf)
 {
     struct thread *self = get_current();
-    if (!self->image_base)
+    if (!self->pgd)
         return -1;
 
     /* initrd-start is a PA; under paging deref it through its VA. */
@@ -144,36 +144,62 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     if (!initrd || cpio_find(initrd, path, &src, &sz) != 0)
         return -1;
 
-    unsigned long total = sz + USER_STACK_SIZE;
-    void *buf = kmalloc(total);
-    if (!buf)
+    /*
+     * Build a brand-new address space rather than mutating the live one.
+     * Snapshot the old VM bookkeeping, install a fresh PGD on a scratch
+     * thread view (we reuse self's fields only after success), then map
+     * the new image. This keeps the running satp/PGD valid until the
+     * switch below, and lets us bail out cleanly on OOM.
+     */
+    unsigned long *new_pgd = pgd_alloc();
+    if (!new_pgd)
         return -1;
-    mem_cpy(buf, src, sz);
 
-    /* CRITICAL for real hardware: flush the instruction cache so that
-     * the CPU sees the newly written code instead of stale cache lines. */
-    asm volatile ("fence.i" ::: "memory");
+    /* Stash the old VM so we can free it after switching away from it. */
+    unsigned long *old_pgd = self->pgd;
+    void *old_image = self->image_base;
+    void *old_stack = self->user_stack_base;
+    void *old_sig   = self->sigpage_base;
 
-    /* Swap image atomically wrt timer IRQ that might invoke schedule. */
-    unsigned long flags = sie_save_clear();
-    void *old = self->image_base;
-    self->image_base = buf;
-    self->image_size = sz;
-    self->total_size = total;
-    sie_restore(flags);
-    kfree(old);
+    /* Point self at the new PGD, then map the image into it (this also
+     * installs a fresh signal page via uvm_setup_image). On failure
+     * restore the old bookkeeping and tear the new PGD down. */
+    self->pgd = new_pgd;
+    self->image_base = NULL;
+    self->user_stack_base = NULL;
+    self->sigpage_base = NULL;
+    if (uvm_setup_image(self, src, sz) != 0) {
+        self->pgd = old_pgd;
+        self->image_base = old_image;
+        self->user_stack_base = old_stack;
+        self->sigpage_base = old_sig;
+        pgd_free(new_pgd);
+        return -1;
+    }
+
+    /* Switch to the new address space, then reclaim the old one via the
+     * saved pointers (satp no longer points at it). */
+    mm_set_satp(new_pgd);
+    if (old_image)
+        buddy_free(old_image);
+    if (old_stack)
+        buddy_free(old_stack);
+    if (old_sig)
+        buddy_free(old_sig);
+    pgd_free(old_pgd);
 
     /* POSIX: exec resets handlers to default and drops pending. The
-     * sigstack is released defensively in case a previous handler had
-     * exec()'d (cannot legitimately happen via sigreturn, but cheap). */
+     * in_handler gate is cleared defensively in case a previous handler
+     * had exec()'d (cannot legitimately happen via sigreturn, but cheap). */
     for (int i = 0; i < NSIG; i++)
         self->sig.handlers[i] = SIG_DFL;
     self->sig.pending = 0;
     signal_release(self);
 
-    /* Rewrite the trap_frame so trap_return_user lands the new image. */
-    tf->sepc = (uintptr_t)buf;
-    tf->sp   = ((uintptr_t)buf + total) & ~0xFUL;
+    /* Rewrite the trap_frame so trap_return_user lands the new image at
+     * the fixed user VAs. */
+    tf->sepc = USER_CODE_VA;
+    tf->sp   = USER_STACK_TOP & ~0xFUL;
     tf->tp = (uintptr_t)self;
     tf->ra = tf->gp = 0;
     tf->t0 = tf->t1 = tf->t2 = 0;
@@ -184,7 +210,6 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     tf->s4 = tf->s5 = tf->s6 = tf->s7 = 0;
     tf->s8 = tf->s9 = tf->s10 = tf->s11 = 0;
 
-    trap_set_user_base((uintptr_t)buf);
     return 0;
 }
 
@@ -211,32 +236,63 @@ static long sys_fork(struct trap_frame *tf)
     extern void user_thread_bootstrap(void);
 
     struct thread *par = get_current();
-    if (!par->image_base)
+    if (!par->pgd)
         return -1;
 
     struct thread *ch = thread_alloc_bare();
     if (!ch)
         return -1;
 
-    /* 1) Full copy of image+stack into a fresh contiguous buffer. */
-    ch->image_size = par->image_size;
-    ch->total_size = par->total_size;
-    ch->image_base = kmalloc(ch->total_size);
-    if (!ch->image_base) {
-        kfree(ch->kstack_base);
-        kfree(ch);
-        return -1;
-    }
-    mem_cpy(ch->image_base, par->image_base, ch->total_size);
-    
-    /* CRITICAL for real hardware: synchronize I-cache after memory copy. */
+    /* 1) Child address space: private PGD (kernel high half shared). */
+    ch->pgd = pgd_alloc();
+    if (!ch->pgd)
+        goto fail_thread;
+
+    /* 2) Duplicate the image frames and map them at the SAME user VA.
+     *    Separate physical frames + identical layout = isolation. */
+    unsigned long img_bytes = par->image_pages;
+    void *img = buddy_alloc(img_bytes);
+    if (!img)
+        goto fail_pgd;
+    mem_cpy(img, par->image_base, img_bytes);
     asm volatile ("fence.i" ::: "memory");
 
-    /* 2) Translate parent's user sp into child's buffer. */
-    uintptr_t off_sp = (uintptr_t)tf->sp - (uintptr_t)par->image_base;
-    uintptr_t child_user_sp = (uintptr_t)ch->image_base + off_sp;
+    /* 3) Duplicate the stack frames likewise. */
+    unsigned long stk_bytes = par->user_stack_size;
+    void *stk = buddy_alloc(stk_bytes);
+    if (!stk)
+        goto fail_img;
+    mem_cpy(stk, par->user_stack_base, stk_bytes);
 
-    /* 3) Plant child's trap_frame at the top of its kstack. */
+    if (map_pages(ch->pgd, USER_CODE_VA, img_bytes,
+                  virt_to_phys(img), PROT_USER_RWX) != 0)
+        goto fail_stk;
+    if (map_pages(ch->pgd, USER_STACK_TOP - stk_bytes, stk_bytes,
+                  virt_to_phys(stk), PROT_USER_DATA) != 0)
+        goto fail_stk;
+
+    /* 3b) Child's own signal page (PROT_USER_RWX). Contents need not be
+     *     copied: the handler stack/trampoline are (re)established at
+     *     dispatch time; we only need the backing frame mapped at the same
+     *     SIGPAGE_VA so a signal can be delivered to the child in U-mode. */
+    void *sig = buddy_alloc(PAGE_SIZE);
+    if (!sig)
+        goto fail_stk;
+    if (map_pages(ch->pgd, SIGPAGE_VA, PAGE_SIZE,
+                  virt_to_phys(sig), PROT_USER_RWX) != 0)
+        goto fail_sig;
+
+    ch->image_base      = img;
+    ch->image_size      = par->image_size;
+    ch->image_pages     = img_bytes;
+    ch->user_stack_base = stk;
+    ch->user_stack_size = stk_bytes;
+    ch->sigpage_base    = sig;
+
+    /* 4) Plant child's trap_frame at the top of its kstack. The child
+     *    keeps the parent's user sp VERBATIM: parent and child share an
+     *    identical user VA layout, so that VA points into the child's own
+     *    stack frames within its own address space — no translation. */
     uintptr_t top = (uintptr_t)ch->kstack_base + ch->kstack_size;
     top &= ~0xFUL;
     struct trap_frame *cf =
@@ -245,7 +301,6 @@ static long sys_fork(struct trap_frame *tf)
      * not lower it into a libc memcpy() call (we are -nostdlib). */
     mem_cpy(cf, tf, sizeof(*cf));
     cf->a0 = 0;                     /* fork returns 0 in child */
-    cf->sp = child_user_sp;
     cf->tp = (uintptr_t)ch;
 
     /* 4) Wire ctx for first switch_to() to land at user_thread_bootstrap. */
@@ -254,13 +309,12 @@ static long sys_fork(struct trap_frame *tf)
 
     /* 5) Inherit signal handler table from parent; pending/in_handler
      *    do NOT cross the fork boundary (POSIX: child starts with an
-     *    empty pending set), and the sigstack belongs solely to the
-     *    parent's in-flight handler (if any). */
+     *    empty pending set, not running any handler). The child's signal
+     *    page is its own (mapped above), independent of the parent's. */
     mem_cpy(&ch->sig.handlers, &par->sig.handlers,
             sizeof(par->sig.handlers));
     ch->sig.pending       = 0;
     ch->sig.in_handler    = 0;
-    ch->sig.sigstack_base = NULL;
 
     /* 6) Parent linkage + enqueue. */
     ch->parent = par;
@@ -270,6 +324,20 @@ static long sys_fork(struct trap_frame *tf)
 
     thread_enqueue_ready(ch);
     return (long)ch->pid;           /* parent path */
+
+fail_sig:
+    buddy_free(sig);
+fail_stk:
+    buddy_free(stk);
+fail_img:
+    buddy_free(img);
+fail_pgd:
+    pgd_free(ch->pgd);
+    ch->pgd = NULL;
+fail_thread:
+    kfree(ch->kstack_base);
+    kfree(ch);
+    return -1;
 }
 
 /** ----------------------------------------------------------------------
@@ -277,8 +345,8 @@ static long sys_fork(struct trap_frame *tf)
  *
  * Locates the child in self->children (errors -1 if no such child),
  * blocks via thread_block() until the child becomes ZOMBIE, then
- * detaches and hands its kstack/struct off to the zombie reaper.
- * The child's image_base was already freed in sys_exit().
+ * detaches and hands its kstack/struct off to the zombie reaper, which
+ * also reclaims the child's user address space (frames + page tables).
  * @param pid Process id of an existing child.
  * @return Child's exit_status, or -1 if @pid is not a child.
  * -------------------------------------------------------------------- */
@@ -347,10 +415,12 @@ static void sys_exit(long status)
     struct thread *par = self->parent;
     sie_restore(flags);
 
-    if (self->image_base) {
-        kfree(self->image_base);
-        self->image_base = NULL;
-    }
+    /*
+     * Do NOT free the user address space here: satp still points at
+     * self->pgd. The reaper (kill_zombies) frees the image/stack frames
+     * and the page tables after schedule() has switched satp away. Only
+     * the sigstack (kernel-side, not in the user VM) is released now.
+     */
     signal_release(self);
 
     if (par)
@@ -379,7 +449,7 @@ static long sys_stop(long pid)
     }
 
     struct thread *t = find_thread_by_pid((int)pid);
-    if (!t || !t->image_base)
+    if (!t || !t->pgd)
         return -1;
 
     unsigned long flags = sie_save_clear();
@@ -390,10 +460,8 @@ static long sys_stop(long pid)
     struct thread *par = t->parent;
     sie_restore(flags);
 
-    if (t->image_base) {
-        kfree(t->image_base);
-        t->image_base = NULL;
-    }
+    /* The victim's user VM is reclaimed by the reaper; freeing it here
+     * is unsafe (it may still be the live satp of a preempted run). */
     signal_release(t);
     if (par)
         thread_wakeup(par);
@@ -503,7 +571,7 @@ static long sys_kill(int pid, int signum)
     if (signum <= 0 || signum >= NSIG)
         return -1;
     struct thread *t = find_thread_by_pid(pid);
-    if (!t || !t->image_base)
+    if (!t || !t->pgd)
         return -1;
     signal_post(t, signum);
     return 0;

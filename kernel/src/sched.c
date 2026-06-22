@@ -9,6 +9,8 @@
 #include "uart.h"
 #include "utils.h"
 #include "signal.h"
+#include "mm.h"
+#include "buddy.h"
 
 /*
  * Per-thread kernel stack size. 8 KiB exceeds MAX_CHUNK_SIZE so the
@@ -264,8 +266,22 @@ void schedule(void)
 
     sie_restore(flags);
 
-    if (prev != next)
+    if (prev != next) {
+        /*
+         * Install next's address space before switching kernel stacks.
+         * A user process uses its private PGD; a kernel-only thread uses
+         * the kernel PGD. The kernel high half is identical across all
+         * PGDs, so the currently executing kernel code/stack stay valid
+         * across the satp write. Skipping the write when the target PGD
+         * already matches avoids a needless sfence.vma.
+         */
+        unsigned long *next_pgd = next->pgd ? next->pgd : kernel_pgd();
+        unsigned long *prev_pgd = prev->pgd ? prev->pgd : kernel_pgd();
+        if (next_pgd != prev_pgd)
+            mm_set_satp(next_pgd);
+
         switch_to(prev, next);
+    }
 }
 
 /** ----------------------------------------------------------------------
@@ -295,14 +311,50 @@ void thread_exit(void)
 }
 
 /** ----------------------------------------------------------------------
+ * @brief thread_free_user_vm() – Release a process's user VM.
+ *
+ * Frees, in this order: the user image frame block, the user stack frame
+ * block, the signal page, and the page tables + PGD (low-half tables via
+ * uvm_destroy(), then the PGD page). Idempotent: each resource is cleared
+ * after free so a second call (or a never-spawned kernel thread) is a
+ * no-op.
+ *
+ * MUST be called only from a context where satp no longer points at
+ * @t->pgd — i.e. the reap point (kill_zombies), or sys_exec() AFTER it
+ * has switched satp to the new PGD. See PLAN_lab6_basic_ex2 §3.8.
+ * @param t Thread whose address space is to be reclaimed.
+ * -------------------------------------------------------------------- */
+void thread_free_user_vm(struct thread *t)
+{
+    if (t->image_base) {
+        buddy_free(t->image_base);
+        t->image_base = NULL;
+    }
+    if (t->user_stack_base) {
+        buddy_free(t->user_stack_base);
+        t->user_stack_base = NULL;
+    }
+    if (t->sigpage_base) {
+        buddy_free(t->sigpage_base);
+        t->sigpage_base = NULL;
+    }
+    if (t->pgd) {
+        pgd_free(t->pgd);
+        t->pgd = NULL;
+    }
+}
+
+/** ----------------------------------------------------------------------
  * @brief kill_zombies() – Reap exited threads from the idle context.
  *
  * Walks g_zombies, detaches each node under SIE=0 (so a future IRQ
- * cannot race the list mutation), then frees the kernel stack and the
- * thread struct outside the critical section. The bootstrap thread
- * uses kstack_base = NULL as a sentinel to opt out of stack freeing
- * (it sits on the boot stack carved out by the linker, not on a
- * kmalloc'd region).
+ * cannot race the list mutation), then frees the user address space,
+ * the kernel stack and the thread struct outside the critical section.
+ * The user VM is freed HERE (not at sys_exit) so satp has long since
+ * switched away from the dying PGD. The bootstrap thread uses
+ * kstack_base = NULL as a sentinel to opt out of stack freeing (it sits
+ * on the boot stack carved out by the linker, not on a kmalloc'd
+ * region).
  * -------------------------------------------------------------------- */
 static void kill_zombies(void)
 {
@@ -317,6 +369,7 @@ static void kill_zombies(void)
         list_del(&z->link);
         sie_restore(flags);
 
+        thread_free_user_vm(z);
         if (z->kstack_base)
             kfree(z->kstack_base);
         if (z != &g_bootstrap)
@@ -428,10 +481,106 @@ plant_initial_frame(struct thread *t, uintptr_t entry, uintptr_t user_sp)
  * @param path Filename inside the initial ramdisk.
  * @return New thread on success, NULL on lookup / OOM failure.
  * -------------------------------------------------------------------- */
+/** ----------------------------------------------------------------------
+ * @brief round_up_page() – Round @n up to a PAGE_SIZE multiple.
+ * @param n Byte count.
+ * @return n rounded up to the next page boundary (n==0 -> 0).
+ * -------------------------------------------------------------------- */
+static inline unsigned long round_up_page(unsigned long n)
+{
+    return (n + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uvm_setup_image() – Populate a user address space from an image.
+ *
+ * Allocates a page-rounded, physically contiguous image frame block and
+ * a stack frame block from the buddy allocator, copies @sz program bytes
+ * into the image block, then maps both into @t->pgd at the fixed user
+ * VAs: the image at USER_CODE_VA (PROT_USER_RWX, since a raw binary
+ * carries no text/data boundary) and the stack just below USER_STACK_TOP
+ * (PROT_USER_DATA). The frame blocks stay contiguous in PA so a single
+ * buddy_free reclaims each, while map_pages() still installs true 4 KiB
+ * leaves. On failure every partial allocation is rolled back.
+ * @param t   Thread with a valid @t->pgd (from pgd_alloc()).
+ * @param src Program bytes (kernel VA) to load.
+ * @param sz  Program length in bytes.
+ * @return 0 on success, -1 on OOM.
+ * -------------------------------------------------------------------- */
+int uvm_setup_image(struct thread *t, const void *src, unsigned long sz)
+{
+    unsigned long img_bytes = round_up_page(sz);
+    if (img_bytes == 0)                 /* an empty image is meaningless */
+        return -1;
+    unsigned long stk_bytes = USER_STACK_SIZE;
+
+    void *img = buddy_alloc(img_bytes);
+    if (!img)
+        return -1;
+    void *stk = buddy_alloc(stk_bytes);
+    if (!stk) {
+        buddy_free(img);
+        return -1;
+    }
+    /* Dedicated U-mode signal page: the handler stack + sigreturn
+     * trampoline must live at a PTE_U user VA (a kernel VA would fault in
+     * U-mode under Sv39). One page suffices because in_handler forbids
+     * nested dispatch. */
+    void *sig = buddy_alloc(PAGE_SIZE);
+    if (!sig) {
+        buddy_free(stk);
+        buddy_free(img);
+        return -1;
+    }
+
+    mem_cpy(img, src, sz);
+    asm volatile ("fence.i" ::: "memory");
+
+    if (map_pages(t->pgd, USER_CODE_VA, img_bytes,
+                  virt_to_phys(img), PROT_USER_RWX) != 0)
+        goto fail;
+    if (map_pages(t->pgd, USER_STACK_TOP - stk_bytes, stk_bytes,
+                  virt_to_phys(stk), PROT_USER_DATA) != 0)
+        goto fail;
+    if (map_pages(t->pgd, SIGPAGE_VA, PAGE_SIZE,
+                  virt_to_phys(sig), PROT_USER_RWX) != 0)
+        goto fail;
+
+    t->image_base      = img;
+    t->image_size      = sz;
+    t->image_pages     = img_bytes;
+    t->user_stack_base = stk;
+    t->user_stack_size = stk_bytes;
+    t->sigpage_base    = sig;
+    return 0;
+
+fail:
+    /* Drop any intermediate tables map_pages may have built, plus the
+     * frame blocks. t->pgd is left valid (high half intact) for retry
+     * or for the caller to pgd_free(). */
+    uvm_destroy(t->pgd);
+    buddy_free(img);
+    buddy_free(stk);
+    buddy_free(sig);
+    return -1;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief thread_spawn_user() – Boot a user process from initrd.
+ *
+ * Looks up @path in the cpio archive, builds a private Sv39 address
+ * space (pgd_alloc + uvm_setup_image) with the image at USER_CODE_VA and
+ * the stack below USER_STACK_TOP, then constructs a thread whose first
+ * switch_to() lands at user_thread_bootstrap and sret's into U-mode at
+ * VA 0. The new thread is linked as a child of the caller.
+ * @param path Filename inside the initial ramdisk.
+ * @return New thread on success, NULL on lookup / OOM failure.
+ * -------------------------------------------------------------------- */
 struct thread *thread_spawn_user(const char *path)
 {
-    const void *initrd = (const void *)
-        dtb_getprop("/chosen", "linux,initrd-start");
+    /* initrd-start is a PA; under paging deref it through its VA. */
+    uintptr_t initrd_pa = dtb_getprop("/chosen", "linux,initrd-start");
+    const void *initrd = initrd_pa ? phys_to_virt(initrd_pa) : 0;
     if (!initrd)
         return NULL;
 
@@ -444,27 +593,18 @@ struct thread *thread_spawn_user(const char *path)
     if (!t)
         return NULL;
 
-    t->image_size = sz;
-    t->total_size = sz + USER_STACK_SIZE;
-    t->image_base = kmalloc(t->total_size);
-    if (!t->image_base) {
-        kfree(t->kstack_base);
-        kfree(t);
-        return NULL;
-    }
-    mem_cpy(t->image_base, src, sz);
+    t->pgd = pgd_alloc();
+    if (!t->pgd)
+        goto fail_thread;
 
-    asm volatile ("fence.i" ::: "memory");
+    if (uvm_setup_image(t, src, sz) != 0)
+        goto fail_pgd;
 
-    uintptr_t entry   = (uintptr_t)t->image_base;
-    uintptr_t user_sp = ((uintptr_t)t->image_base + t->total_size)
-                        & ~0xFUL;
-    struct trap_frame *tf = plant_initial_frame(t, entry, user_sp);
+    struct trap_frame *tf =
+        plant_initial_frame(t, USER_CODE_VA, USER_STACK_TOP & ~0xFUL);
 
     t->ctx.sp = (unsigned long)tf;
     t->ctx.ra = (unsigned long)user_thread_bootstrap;
-
-    trap_set_user_base(entry);
 
     unsigned long flags = sie_save_clear();
     if (t->parent)
@@ -473,6 +613,14 @@ struct thread *thread_spawn_user(const char *path)
 
     thread_enqueue_ready(t);
     return t;
+
+fail_pgd:
+    pgd_free(t->pgd);
+    t->pgd = NULL;
+fail_thread:
+    kfree(t->kstack_base);
+    kfree(t);
+    return NULL;
 }
 
 /* ---------- Ex2: pid lookup -------------------------------------------- */

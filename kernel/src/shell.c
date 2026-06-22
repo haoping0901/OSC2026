@@ -256,7 +256,7 @@ static void shell_stop_pid(const char *args)
     }
 
     struct thread *t = find_thread_by_pid(pid);
-    if (!t || !t->image_base) {
+    if (!t || !t->pgd) {
         uart_puts("stop: pid not found\n");
         return;
     }
@@ -269,10 +269,7 @@ static void shell_stop_pid(const char *args)
     struct thread *par = t->parent;
     sie_restore(flags);
 
-    if (t->image_base) {
-        kfree(t->image_base);
-        t->image_base = NULL;
-    }
+    /* User VM reclaimed by the reaper once satp has switched away. */
     if (par)
         thread_wakeup(par);
     uart_puts("[stop] pid=");
@@ -321,7 +318,7 @@ static void shell_kill_pid(const char *args)
     }
 
     struct thread *t = find_thread_by_pid(pid);
-    if (!t || !t->image_base) {
+    if (!t || !t->pgd) {
         uart_puts("kill: pid not found\n");
         return;
     }

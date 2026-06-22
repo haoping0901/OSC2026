@@ -70,16 +70,44 @@ struct thread {
     struct list_head  sibling;          /* node in parent->children */
     int               exit_status;
 
+    /* ---------------- Lab6 Ex2: per-process address space ------------- */
+
     /*
-     * User memory: a single contiguous kmalloc'd buffer. Layout:
-     *   [image_base, image_base + image_size)         = code+data+bss
-     *   [image_base + image_size, image_base+total_size) = user stack
-     * total_size = image_size + USER_STACK_SIZE. NULL for kernel-only
-     * threads (bootstrap, idle, and any future kernel worker).
+     * Root page table (kernel VA) of this process's private Sv39 address
+     * space. Its high half is shared with the kernel PGD; its low half
+     * maps the user image at USER_CODE_VA and the user stack below
+     * USER_STACK_TOP. NULL for kernel-only threads, which run on the
+     * kernel PGD (kernel_pgd()).
+     */
+    unsigned long    *pgd;
+
+    /*
+     * Backing physical frames for the user image and stack, each held by
+     * its contiguous-block kernel VA (buddy_alloc'd):
+     *   image_base       = kernel VA of the image frame block; the user
+     *                      sees it at USER_CODE_VA. Used for memcpy on
+     *                      load/fork and for a single buddy_free on exit.
+     *   image_size       = bytes of program copied in.
+     *   image_pages      = bytes mapped for the image (page-rounded).
+     *   user_stack_base  = kernel VA of the stack frame block; the user
+     *                      sees its top at USER_STACK_TOP.
+     *   user_stack_size  = bytes mapped for the user stack.
+     * All NULL/0 for kernel-only threads.
      */
     void             *image_base;
     unsigned long     image_size;
-    unsigned long     total_size;
+    unsigned long     image_pages;
+    void             *user_stack_base;
+    unsigned long     user_stack_size;
+
+    /*
+     * Kernel VA backing the per-process signal page mapped at SIGPAGE_VA
+     * (PROT_USER_RWX). Holds the sigreturn trampoline (page base) plus the
+     * U-mode handler stack. buddy_alloc'd in uvm_setup_image()/sys_fork(),
+     * reclaimed by thread_free_user_vm() at reap time. NULL for kernel-only
+     * threads.
+     */
+    void             *sigpage_base;
 
     /* Per-thread POSIX signal state. Untouched for kernel-only threads
      * (their pending bitmap stays 0 so signal_check_and_dispatch is a
@@ -116,6 +144,26 @@ void thread_wakeup(struct thread *t);
 /* Spawn the first user process from a file in initrd. Returns the new
  * thread or NULL on lookup / OOM failure. */
 struct thread *thread_spawn_user(const char *path);
+
+/*
+ * Build @t's user address space for a freshly loaded image: allocate
+ * image + stack frame blocks, copy @sz bytes of program from @src into
+ * the image block, and map both at the fixed user VAs (image at
+ * USER_CODE_VA, stack below USER_STACK_TOP) in @t->pgd. @t->pgd must
+ * already be a valid user PGD (pgd_alloc()). On success fills
+ * image_base/image_size/image_pages/user_stack_base/user_stack_size and
+ * returns 0; on OOM frees whatever it allocated and returns -1.
+ * Shared by thread_spawn_user() and sys_exec().
+ */
+int uvm_setup_image(struct thread *t, const void *src, unsigned long sz);
+
+/*
+ * Reclaim @t's user image/stack frames and page tables immediately.
+ * Used by sys_exec() to drop the OLD address space AFTER satp has been
+ * switched to the new one. Do NOT call on a thread whose PGD is the
+ * live satp root.
+ */
+void thread_free_user_vm(struct thread *t);
 
 /* Park @t on the zombie list so the idle thread's reaper frees its
  * kstack and struct. Caller MUST have detached @t from any other list

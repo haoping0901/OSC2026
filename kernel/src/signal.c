@@ -8,6 +8,7 @@
 #include "utils.h"
 #include "list.h"
 #include "types.h"
+#include "buddy.h"
 
 /*
  * Lab5 Advanced Exercise — POSIX signal core.
@@ -92,22 +93,19 @@ void signal_post(struct thread *t, int signum)
 }
 
 /** ----------------------------------------------------------------------
- * @brief signal_release() – Free the per-handler sigstack of @t if any.
+ * @brief signal_release() – Clear the in_handler gate of @t.
  *
- * Used by the process-exit paths (sys_exit / sys_stop / default
- * terminate) so a thread dying mid-handler does not leak its
- * kmalloc'd sigstack. Also clears in_handler so any speculative
- * future re-use of the thread struct starts clean.
+ * Used by the process-exit / re-image paths (sys_exit / sys_stop /
+ * sys_exec / default terminate) so a thread dying or re-imaging
+ * mid-handler leaves a clean signal state. The signal page itself is
+ * owned by the process VM (t->sigpage_base) and reclaimed by the reaper,
+ * so nothing is freed here.
  * @param t Thread to release.
  * -------------------------------------------------------------------- */
 void signal_release(struct thread *t)
 {
     if (!t)
         return;
-    if (t->sig.sigstack_base) {
-        kfree(t->sig.sigstack_base);
-        t->sig.sigstack_base = NULL;
-    }
     t->sig.in_handler = 0;
 }
 
@@ -115,10 +113,10 @@ void signal_release(struct thread *t)
  * @brief signal_default_terminate() – Apply the default "terminate" rule.
  *
  * Mirrors sys_stop()'s remote-pid body: detach @t from the runq if it
- * was READY, mark it ZOMBIE with exit_status = -1, free the user
- * image, release the sigstack (if any), and wake the parent so a
- * pending waitpid resumes. The thread struct/kstack is reaped later
- * by sched_zombify() through sys_waitpid() / sys_stop().
+ * was READY, mark it ZOMBIE with exit_status = -1, clear the in_handler
+ * gate, and wake the parent so a pending waitpid resumes. The user
+ * address space and the thread struct/kstack are reclaimed later by the
+ * reaper, after satp has switched away from @t.
  * @param t Thread to terminate (may be the current thread).
  * -------------------------------------------------------------------- */
 void signal_default_terminate(struct thread *t)
@@ -134,10 +132,10 @@ void signal_default_terminate(struct thread *t)
     struct thread *par = t->parent;
     sie_restore(flags);
 
-    if (t->image_base) {
-        kfree(t->image_base);
-        t->image_base = NULL;
-    }
+    /* The user address space (image/stack frames + page tables) is
+     * reclaimed by the reaper, after satp has switched away from this
+     * thread's PGD; freeing it here would risk tearing down the live
+     * satp root. Only the kernel-side sigstack is released now. */
     signal_release(t);
 
     if (par)
@@ -173,11 +171,11 @@ static void plant_sigreturn_trampoline(void *stack_base)
  *   - SIG_DFL/NULL  : terminate via signal_default_terminate(); the
  *                     caller in trap.c notices state == ZOMBIE and
  *                     calls schedule() so this thread never sret's;
- *   - user pointer  : snapshot @tf into self->sig.saved, allocate the
- *                     sigstack, plant the trampoline at its base, and
- *                     rewrite @tf so the impending sret lands at the
- *                     handler with sp on the new stack and ra pointing
- *                     at the trampoline.
+ *   - user pointer  : snapshot @tf into self->sig.saved, plant the
+ *                     trampoline at the signal page base, and rewrite @tf
+ *                     so the impending sret lands at the handler with sp
+ *                     on the signal page (USER VA) and ra pointing at the
+ *                     trampoline's USER VA.
  *
  * tf->a0 is set to the signum so handlers declared `void(int)` see it;
  * `void()` handlers simply ignore the extra argument.
@@ -211,39 +209,42 @@ void signal_check_and_dispatch(struct trap_frame *tf)
         return;
     }
 
+    /* A user process must own a signal page to receive a handler. (Kernel
+     * threads were already filtered out by image_base above; this also
+     * guards a never-set-up image.) */
+    if (!self->sigpage_base)
+        return;
+
     /* User handler path: snapshot full context for sigreturn. mem_cpy
      * avoids the compiler lowering struct assignment into a libc
      * memcpy call (kernel is -nostdlib / no libgcc). */
     mem_cpy(&self->sig.saved, tf, sizeof(*tf));
 
-    void *stk = kmalloc(SIGSTACK_SIZE);
-    if (!stk) {
-        /* OOM: fall back to default behaviour. */
-        signal_default_terminate(self);
-        return;
-    }
-    self->sig.sigstack_base = stk;
+    /* Plant the trampoline through the page's kernel-VA backing while we
+     * are still in S-mode; the handler will reach it at SIGPAGE_VA in U. */
+    plant_sigreturn_trampoline(self->sigpage_base);
     self->sig.in_handler = 1;
 
-    plant_sigreturn_trampoline(stk);
-
-    /* Hand the handler a 16-byte aligned sp at the top of the stack,
-     * leaving the trampoline (at stack base) reachable via ra. */
-    uintptr_t top = (uintptr_t)stk + SIGSTACK_SIZE;
+    /* The handler runs in U-mode, so sp and ra must be the USER VAs of the
+     * signal page (PTE_U), not its kernel-VA backing. Stack grows down
+     * from the page top; the trampoline sits at the page base (SIGPAGE_VA)
+     * and stays reachable via ra. */
+    uintptr_t top = SIGPAGE_VA + PAGE_SIZE;
     top &= ~0xFUL;
 
     tf->sepc = (uintptr_t)h;
     tf->sp   = top;
     tf->a0   = (uintptr_t)signum;
-    tf->ra   = (uintptr_t)stk;          /* sigreturn trampoline base */
+    tf->ra   = SIGPAGE_VA;              /* sigreturn trampoline base */
 }
 
 /** ----------------------------------------------------------------------
  * @brief signal_return() – Body of the SYS_SIGRETURN syscall.
  *
- * Restores the pre-signal trap_frame snapshot, releases the per-call
- * sigstack, and clears the in_handler gate so the next pending signal
- * can be delivered on the following trap-return cycle. Returns the
+ * Restores the pre-signal trap_frame snapshot and clears the in_handler
+ * gate so the next pending signal can be delivered on the following
+ * trap-return cycle. The signal page is reused across calls (no per-call
+ * allocation), so nothing is freed here. Returns the
  * original syscall return value (saved.a0) so that the do_syscall()
  * caller's `tf->a0 = do_syscall(tf)` write preserves whatever a0 was
  * before the signal interrupted U-mode.

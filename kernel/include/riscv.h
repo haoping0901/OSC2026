@@ -23,6 +23,51 @@
 #define PROT_KERNEL  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D)
 #define PROT_DEVICE  (PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D)
 
+/* ---------- User virtual address layout (Lab6 Basic Ex2) --------------- */
+
+/*
+ * Fixed user VA layout mandated by the lab spec. Every user process sees
+ * the same VAs (image at 0, stack growing down from USER_STACK_TOP);
+ * isolation comes from each process owning a private set of physical
+ * frames behind these identical VAs.
+ *
+ *   USER_CODE_VA   image (code/data/bss) loaded here — required because
+ *                  osctest.bin is position-dependent and uses absolute
+ *                  low addresses (e.g. 0x1e8480).
+ *   USER_STACK_TOP exclusive top of the user stack (PGD index 1, fully
+ *                  disjoint from the image's PGD index 0).
+ */
+#define USER_CODE_VA      0x0UL
+#define USER_STACK_TOP    0x0000004000000000UL   /* 0x40_0000_0000 (256 GiB) */
+
+/*
+ * Per-process signal page (Lab5 Advanced Ex / Lab6 paging fix). A POSIX
+ * signal handler runs in U-mode, so the stack it executes on and the
+ * sigreturn trampoline it returns into must be USER virtual addresses
+ * carrying PTE_U — a kmalloc'd kernel VA is unreachable from U-mode under
+ * Sv39 and would fault on first use. We map one dedicated PROT_USER_RWX
+ * page per process to hold both: the trampoline at SIGPAGE_VA (page base)
+ * and the handler stack growing down from the page top.
+ *
+ * VPN[2]=255, VPN[1]=0, VPN[0]=0: a PGD slot distinct from the image
+ * (VPN[2]=0); it shares PGD slot 255 with the user stack but lives in a
+ * disjoint PMD (0 vs 511), so their page tables never overlap. Stays
+ * below USER_STACK_TOP.
+ */
+#define SIGPAGE_VA        0x0000003FC0000000UL
+
+/*
+ * User-page permission sets. All carry PTE_U; A/D are pre-set so a first
+ * touch never faults (we do not implement A/D-driven paging).
+ *
+ * Raw binaries carry no ELF section info to separate text from data, so
+ * the whole image is mapped PROT_USER_RWX. PROT_USER_CODE/DATA are kept
+ * for a future ELF-aware loader that can enforce W^X.
+ */
+#define PROT_USER_CODE  (PTE_V | PTE_R | PTE_X | PTE_U | PTE_A | PTE_D)
+#define PROT_USER_DATA  (PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D)
+#define PROT_USER_RWX   (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D)
+
 /*
  * Sv39 page-table walk shifts. A 39-bit VA splits into three 9-bit VPN
  * fields plus a 12-bit page offset:
@@ -48,6 +93,14 @@
 
 /* Extract the next-level table PA from a non-leaf PTE. */
 #define PTE_TO_PA(pte)   ((((unsigned long)(pte) >> 10) << 12))
+
+/*
+ * Per-level page-table index extraction for an Sv39 walk.
+ *   level 2 -> PGD (VPN[2]), level 1 -> PMD (VPN[1]), level 0 -> PTE (VPN[0])
+ * Each level is a 9-bit field; PTE_SHIFT (12) is the page offset width.
+ */
+#define PT_INDEX(va, level) \
+    (((unsigned long)(va) >> (PTE_SHIFT + (level) * 9)) & (PTRS_PER_TABLE - 1))
 
 /* ---------- sstatus bits ------------------------------------------------ */
 #define SSTATUS_SIE   (1UL << 1)   /* S-mode interrupt enable            */

@@ -22,10 +22,11 @@ _Static_assert(sizeof(struct trap_frame) == TF_SIZE,
                "struct trap_frame size must match TF_SIZE in trap.h");
 
 /*
- * Absolute load address of the running user program. Updated by
- * run_user_program() right before enter_user_mode(); consumed by
- * trap_handler() so diagnostic output shows offsets relative to the
- * program image rather than raw kmalloc() pointers.
+ * Diagnostic base subtracted from sepc when printing an unhandled-trap
+ * report. Under Lab6 Ex2 every user image is mapped at USER_CODE_VA (0)
+ * in its own address space, so the user VA already IS the program-
+ * relative offset and this stays 0. Retained (with trap_set_user_base())
+ * for callers that may want a non-zero base in future.
  */
 static uintptr_t g_user_base = 0;
 
@@ -38,7 +39,7 @@ void trap_set_user_base(uintptr_t base)
  * @brief deliver_pending_signal() – Return-to-U gate for signal delivery.
  *
  * Called on every trap-handler exit path that will sret into U-mode.
- * Restricts dispatch to user processes (image_base != NULL) so kernel
+ * Restricts dispatch to user processes (pgd != NULL) so kernel
  * threads, the bootstrap thread and the idle thread are skipped. If
  * the default handler kills the current thread, we re-enter
  * schedule() so the kernel never sret's into a dead user image; the
@@ -48,7 +49,7 @@ void trap_set_user_base(uintptr_t base)
 static void deliver_pending_signal(struct trap_frame *tf)
 {
     struct thread *cur = get_current();
-    if (!cur || !cur->image_base)
+    if (!cur || !cur->pgd)
         return;
 
     signal_check_and_dispatch(tf);
@@ -72,6 +73,15 @@ void trap_init(void)
     uintptr_t vec = (uintptr_t)trap_entry;
     asm volatile ("csrw stvec, %0"    :: "r"(vec));
     asm volatile ("csrw sscratch, %0" :: "r"(0UL));
+
+    /*
+     * Lab6 Ex2: permit S-mode to read/write user pages. Syscalls such as
+     * sys_uart_write / sys_display dereference user buffers (PTE_U pages)
+     * while in S-mode; without sstatus.SUM the hardware would fault on
+     * those accesses. We keep SUM set for the whole kernel lifetime —
+     * user-pointer validation is done in software by in_user_range().
+     */
+    asm volatile ("csrs sstatus, %0" :: "r"((unsigned long)SSTATUS_SUM));
 }
 
 /** ----------------------------------------------------------------------

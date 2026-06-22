@@ -15,10 +15,13 @@ struct thread;
  *     SIG_IGN = silently drop, anything else = jump to user-mode handler);
  *   - an in_handler re-entrancy gate that disables nested dispatch;
  *   - a saved trap_frame snapshot used by sigreturn to restore the
- *     pre-signal user context;
- *   - the base of the per-invocation user stack (kmalloc'd) that the
- *     handler runs on, with a tiny sigreturn trampoline planted at its
- *     low address.
+ *     pre-signal user context.
+ *
+ * The handler executes in U-mode on the per-process signal page
+ * (SIGPAGE_VA, see thread->sigpage_base), with a tiny sigreturn
+ * trampoline planted at the page base. That page is part of the user
+ * address space, so its lifetime is owned by the process VM rather than
+ * this state block.
  *
  * Dispatch happens at the trap_handler() return-to-U-mode out-edges,
  * after schedule(), so newly-scheduled threads see pending signals on
@@ -37,7 +40,6 @@ struct signal_state {
     void        (*handlers[NSIG])(void);
     int           in_handler;
     struct trap_frame saved;
-    void         *sigstack_base;
 };
 
 /** ----------------------------------------------------------------------
@@ -103,11 +105,12 @@ long signal_return(struct trap_frame *tf);
 void signal_default_terminate(struct thread *t);
 
 /** ----------------------------------------------------------------------
- * @brief signal_release() – Free any sigstack still attached to @t.
+ * @brief signal_release() – Clear the in_handler gate of @t.
  *
- * Invoked from sys_exit() / sys_stop() so the per-handler buffer is
- * not leaked when a thread dies mid-handler. Safe to call when no
- * sigstack is allocated.
+ * Invoked from sys_exit() / sys_stop() / sys_exec() so a thread dying or
+ * re-imaging mid-handler leaves a clean signal state. The signal page
+ * itself is owned by the process VM (thread->sigpage_base) and reclaimed
+ * separately, so nothing is freed here. Safe to call unconditionally.
  * @param t Thread whose signal state should be quiesced.
  * -------------------------------------------------------------------- */
 void signal_release(struct thread *t);
