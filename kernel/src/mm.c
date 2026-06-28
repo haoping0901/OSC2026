@@ -2,9 +2,11 @@
 #include "riscv.h"
 #include "buddy.h"   /* PAGE_SIZE */
 #include "types.h"
+#include "sched.h"   /* struct thread, vma_list / mmap_top */
+#include "kmalloc.h" /* kmalloc / kfree for struct vma */
 
 /*
- * Early Sv39 page-table setup for the higher-half kernel (Lab6 Basic Ex1).
+ * Early Sv39 page-table setup for the higher-half kernel.
  *
  * setup_vm() builds two linear mappings with 2 MiB PMD-level leaves and
  * enables paging:
@@ -182,7 +184,7 @@ void drop_identity_map(void)
     asm volatile ("sfence.vma zero, zero" ::: "memory");
 }
 
-/* ---------- Lab6 Basic Ex2: per-process address spaces ----------------- */
+/* ---------- Per-process address spaces --------------------------------- */
 
 /** ----------------------------------------------------------------------
  * @brief kernel_pgd() – Expose the static kernel root page table.
@@ -352,4 +354,315 @@ void mm_set_satp(unsigned long *pgd_va)
         "csrw satp, %0\n"
         "sfence.vma zero, zero\n"
         :: "r"(MAKE_SATP(pa)) : "memory");
+}
+
+/* ---------- mmap (anonymous memory) ------------------------------------ */
+
+/** ----------------------------------------------------------------------
+ * @brief mmap_round_up_page() – Round @n up to a PAGE_SIZE multiple.
+ *
+ * Local copy (sched.c has its own static round_up_page); kept private so
+ * the two translation units stay independent.
+ * @param n Byte count.
+ * @return n rounded up to the next page boundary (n==0 -> 0).
+ * -------------------------------------------------------------------- */
+static inline unsigned long mmap_round_up_page(unsigned long n)
+{
+    return (n + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_alloc() – Allocate and populate a struct vma.
+ *
+ * kmalloc's a node (small object → chunk pool) and fills every field.
+ * @prot is already a leaf PTE flag set (incl. PTE_U); it is stored
+ * verbatim so teardown and fork copy need no re-conversion.
+ * @param va      User virtual base (PAGE_SIZE aligned).
+ * @param len     Byte length (PAGE_SIZE aligned).
+ * @param prot    Leaf PTE flag bits.
+ * @param kva     Kernel VA of the backing buddy block.
+ * @param is_mmap 1 for mmap()'d regions, 0 for image/stack/sigpage.
+ * @return New vma, or NULL on OOM.
+ * -------------------------------------------------------------------- */
+struct vma *vma_alloc(unsigned long va, unsigned long len,
+                      unsigned long prot, void *kva, unsigned char is_mmap)
+{
+    struct vma *v = kmalloc(sizeof(*v));
+    if (!v)
+        return NULL;
+    INIT_LIST_HEAD(&v->link);
+    v->va      = va;
+    v->len     = len;
+    v->prot    = prot;
+    v->kva     = kva;
+    v->is_mmap = is_mmap;
+    return v;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_insert_sorted() – Link @vma into @t->vma_list (va-ascending).
+ *
+ * Linear scan for the first existing VMA whose va exceeds @vma->va and
+ * inserts before it, preserving ascending order so gap searches and
+ * overlap checks are single-pass. The list is short (a few regions), so
+ * O(n) insertion is fine.
+ * @param t   Owning thread.
+ * @param vma Node to link (its va field decides position).
+ * -------------------------------------------------------------------- */
+void vma_insert_sorted(struct thread *t, struct vma *vma)
+{
+    struct list_head *it;
+    list_for_each(it, &t->vma_list) {
+        struct vma *cur = list_entry(it, struct vma, link);
+        if (cur->va > vma->va)
+            break;
+    }
+    /* Insert before `it` (== list head when appending at the tail). */
+    list_add_tail(&vma->link, it);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_overlaps() – Test whether [base, base+len) hits any VMA.
+ *
+ * Half-open interval intersection over the whole vma_list. Used both by
+ * the hint path (reject an overlapping hint) and the top-down search
+ * (skip occupied gaps).
+ * @param t    Thread whose vma_list to scan.
+ * @param base Candidate base VA.
+ * @param len  Candidate byte length.
+ * @return 1 if any VMA overlaps, 0 if the range is free.
+ * -------------------------------------------------------------------- */
+static int vma_overlaps(struct thread *t, unsigned long base,
+                        unsigned long len)
+{
+    struct list_head *it;
+    list_for_each(it, &t->vma_list) {
+        struct vma *v = list_entry(it, struct vma, link);
+        if (base < v->va + v->len && v->va < base + len)
+            return 1;
+    }
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief mmap_find_va() – Choose a base VA for a new mapping.
+ *
+ * If @hint is non-zero, page-aligned and free, it is honoured. Otherwise
+ * the kernel self-selects top-down from t->mmap_top, stepping a page at a
+ * time until a @len-sized hole with no VMA overlap is found, then drops
+ * mmap_top one guard page BELOW the chosen base so the next self-selected
+ * mapping leaves an unmapped page between regions. The guard page makes a
+ * read/write just past a region's end fault (the lab's out-of-bounds test
+ * relies on this), and likewise keeps the topmost mmap region from abutting
+ * the signal page (mmap_top is initialised one guard page below SIGPAGE_VA;
+ * see MMAP_CURSOR_INIT). USER_CODE_VA (0) is the low bound; running below
+ * it means the address space is exhausted.
+ * @param t    Calling thread.
+ * @param hint User-supplied address hint (0 if none).
+ * @param len  Page-rounded length to place.
+ * @return Chosen base VA, or 0 if no space.
+ * -------------------------------------------------------------------- */
+static unsigned long mmap_find_va(struct thread *t, unsigned long hint,
+                                  unsigned long len)
+{
+    if (hint != 0 && (hint & (PAGE_SIZE - 1)) == 0 &&
+        !vma_overlaps(t, hint, len))
+        return hint;
+
+    /*
+     * Top-down search: the highest candidate base is mmap_top - len. Walk
+     * downward a page at a time until a len-sized hole with no VMA overlap
+     * is found. mmap_top is page-aligned, so every candidate is too.
+     */
+    if (t->mmap_top < len)
+        return 0;
+    for (unsigned long base = t->mmap_top - len;
+         base >= PAGE_SIZE; base -= PAGE_SIZE) {
+        if (!vma_overlaps(t, base, len)) {
+            /* Reserve one guard page below this region for the next pick. */
+            t->mmap_top = base - PAGE_SIZE;
+            return base;
+        }
+    }
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief mmap_prot_to_pte() – Convert user PROT_* bits to leaf PTE flags.
+ *
+ * Always sets PTE_V | PTE_U | PTE_A | PTE_D (A/D pre-set, matching the
+ * PROT_USER_* convention of not doing A/D-driven paging). RWX bits follow
+ * the request; PROT_WRITE implies PTE_R because Sv39 reserves W=1,R=0.
+ * PROT_NONE yields V|U with no RWX — present but inaccessible, so a touch
+ * page-faults (the intended "reserved" semantics).
+ * @param prot User PROT_* bit set.
+ * @return Leaf PTE flag set.
+ * -------------------------------------------------------------------- */
+static unsigned long mmap_prot_to_pte(int prot)
+{
+    unsigned long pte = PTE_V | PTE_U | PTE_A | PTE_D;
+    if (prot & PROT_READ)
+        pte |= PTE_R;
+    if (prot & PROT_WRITE)
+        pte |= PTE_W | PTE_R;       /* W must accompany R under Sv39 */
+    if (prot & PROT_EXEC)
+        pte |= PTE_X;
+    return pte;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief zero_block() – Clear @bytes of a buddy block word by word.
+ *
+ * Anonymous pages must read as zero so a fresh mapping never leaks the
+ * previous owner's data. @p is a linear-map kernel VA; @bytes is a
+ * PAGE_SIZE multiple.
+ * @param p     Block base (kernel VA).
+ * @param bytes Length to clear.
+ * -------------------------------------------------------------------- */
+static void zero_block(void *p, unsigned long bytes)
+{
+    unsigned long *w = p;
+    for (unsigned long i = 0; i < bytes / sizeof(unsigned long); i++)
+        w[i] = 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief do_mmap() – Anonymous, eager mmap() core.
+ *
+ * Validates length, picks a base (hint or top-down), allocates a zeroed
+ * buddy block, maps 4 KiB leaves carrying the converted prot into t->pgd,
+ * and records a VMA. On any failure after allocation the partial state is
+ * rolled back. A final sfence.vma makes the new leaves visible to U-mode
+ * before the syscall returns. Demand paging is intentionally not done:
+ * the frames are present immediately.
+ * @param t      Calling thread (valid t->pgd required).
+ * @param addr   Placement hint.
+ * @param length Requested length (rounded up to a page).
+ * @param prot   User PROT_* bits.
+ * @param flags  User MAP_* bits (MAP_ANONYMOUS required).
+ * @return User base VA, or MAP_FAILED on bad args / OOM.
+ * -------------------------------------------------------------------- */
+void *do_mmap(struct thread *t, void *addr, unsigned long length,
+              int prot, int flags)
+{
+    if (length == 0 || !t->pgd)
+        return MAP_FAILED;
+    if (!(flags & MAP_ANONYMOUS))   /* only anonymous mappings supported */
+        return MAP_FAILED;
+
+    unsigned long len = mmap_round_up_page(length);
+
+    unsigned long base = mmap_find_va(t, (unsigned long)addr, len);
+    if (base == 0)
+        return MAP_FAILED;
+
+    unsigned long pte_prot = mmap_prot_to_pte(prot);
+
+    void *kva = buddy_alloc(len);
+    if (!kva)
+        return MAP_FAILED;
+    zero_block(kva, len);
+
+    if (map_pages(t->pgd, base, len, virt_to_phys(kva), pte_prot) != 0) {
+        buddy_free(kva);
+        return MAP_FAILED;
+    }
+
+    struct vma *vma = vma_alloc(base, len, pte_prot, kva, 1);
+    if (!vma) {
+        /* Leaves were installed but unwinding them needs a teardown that
+         * uvm_destroy() will do at exit; freeing the frame avoids a leak
+         * now while the (orphaned) leaves resolve to nothing referenced. */
+        buddy_free(kva);
+        return MAP_FAILED;
+    }
+    vma_insert_sorted(t, vma);
+
+    /* New leaves are live in t->pgd; flush so U-mode sees them at once. */
+    asm volatile ("sfence.vma zero, zero" ::: "memory");
+    return (void *)base;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_free_list() – Free every VMA backing block + node on a list.
+ *
+ * Drains @head from the front: detaches each node, returns its buddy
+ * block, and frees the node itself. Leaves @head empty. Shared by
+ * vma_unmap_all() (the thread's live list) and sys_exec() (a detached
+ * old list). Must run only when satp no longer points at the owning
+ * address space.
+ * @param head List head of VMAs to release.
+ * -------------------------------------------------------------------- */
+void vma_free_list(struct list_head *head)
+{
+    while (!list_empty(head)) {
+        struct vma *v = list_entry(head->next, struct vma, link);
+        list_del(&v->link);
+        if (v->kva)
+            buddy_free(v->kva);
+        kfree(v);
+    }
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_unmap_all() – Free every VMA backing block + node of @t.
+ *
+ * Thin wrapper that drains t->vma_list via vma_free_list(). Covers
+ * image/stack/sigpage and all mmap regions uniformly, so
+ * thread_free_user_vm() no longer issues the old per-region buddy_free
+ * calls (which would double-free). Page tables and the PGD are reclaimed
+ * separately by pgd_free().
+ * @param t Thread whose VMAs are to be released.
+ * -------------------------------------------------------------------- */
+void vma_unmap_all(struct thread *t)
+{
+    vma_free_list(&t->vma_list);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_detach_all() – Move @t's VMA list onto @dst, empty @t.
+ *
+ * Re-points the circular list so every node currently on t->vma_list now
+ * hangs off @dst, then re-initialises t->vma_list to empty. No nodes are
+ * freed. @dst must be an empty, initialised list head. Used by sys_exec()
+ * to set the old address space's VMAs aside before building the new one.
+ * @param t   Thread whose list is moved out.
+ * @param dst Destination head (empty on entry).
+ * -------------------------------------------------------------------- */
+void vma_detach_all(struct thread *t, struct list_head *dst)
+{
+    struct list_head *src = &t->vma_list;
+    if (list_empty(src)) {
+        INIT_LIST_HEAD(dst);
+        return;
+    }
+    /* Stitch the src ring (minus its head node) onto dst. */
+    dst->next       = src->next;
+    dst->prev       = src->prev;
+    dst->next->prev = dst;
+    dst->prev->next = dst;
+    INIT_LIST_HEAD(src);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_reattach() – Move @src's VMAs back onto an empty t->vma_list.
+ *
+ * Inverse of vma_detach_all(); the sys_exec() failure path uses it to put
+ * the old region list back after the new image build failed (and left
+ * t->vma_list empty). No nodes are freed. @t->vma_list must be empty.
+ * @param t   Thread to restore the list onto.
+ * @param src Saved list head holding the detached VMAs.
+ * -------------------------------------------------------------------- */
+void vma_reattach(struct thread *t, struct list_head *src)
+{
+    struct list_head *dst = &t->vma_list;
+    if (list_empty(src)) {
+        INIT_LIST_HEAD(dst);
+        return;
+    }
+    dst->next       = src->next;
+    dst->prev       = src->prev;
+    dst->next->prev = dst;
+    dst->prev->next = dst;
+    INIT_LIST_HEAD(src);
 }

@@ -16,7 +16,7 @@
 #include "mm.h"
 
 /*
- * Lab5 Basic Ex2 system-call layer.
+ * System-call layer.
  *
  * Conventions:
  *   - All handlers receive their arguments unpacked from tf->a0..a2.
@@ -27,14 +27,18 @@
  */
 
 /** ----------------------------------------------------------------------
- * @brief in_user_range() – User-pointer validation against the VA layout.
+ * @brief in_user_range() – User-pointer validation against the VMA list.
  *
- * With per-process paging (Lab6 Ex2) every process sees the same fixed
- * user VAs: the image at [USER_CODE_VA, image_top) and the stack at
- * [stack_lo, USER_STACK_TOP). A valid user buffer must lie wholly inside
- * one of those two mapped intervals. This both rejects stray kernel/MMIO
- * pointers and keeps the kernel from dereferencing an unmapped user VA
- * (which would page-fault in S-mode). Treats overflow as failure.
+ * A valid user buffer must lie wholly inside one mapped region. Since
+ * every region (image, stack, signal page, each mmap result) is a VMA on
+ * cur->vma_list, the check is a single scan for a VMA whose [va, va+len)
+ * contains [a, e). This both rejects stray kernel/MMIO pointers and keeps
+ * the kernel from dereferencing an unmapped user VA (which would page-
+ * fault in S-mode). Treats overflow as failure.
+ *
+ * Note: this validates mapping presence only, not prot — a PROT_NONE mmap
+ * region passes here but a real access still faults in U-mode. Per-prot
+ * checking is a deliberate non-goal.
  * @param p Start of the user buffer.
  * @param n Size in bytes.
  * @return 1 if the range is wholly inside a mapped user region, else 0.
@@ -50,13 +54,12 @@ static int in_user_range(const void *p, unsigned long n)
     if (!cur->pgd)                      /* not a user process */
         return 0;
 
-    uintptr_t image_top = USER_CODE_VA + cur->image_pages;
-    uintptr_t stack_lo  = USER_STACK_TOP - cur->user_stack_size;
-
-    if (a >= USER_CODE_VA && e <= image_top)
-        return 1;
-    if (a >= stack_lo && e <= USER_STACK_TOP)
-        return 1;
+    struct list_head *it;
+    list_for_each(it, &cur->vma_list) {
+        struct vma *v = list_entry(it, struct vma, link);
+        if (a >= v->va && e <= v->va + v->len)
+            return 1;
+    }
     return 0;
 }
 
@@ -155,37 +158,44 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     if (!new_pgd)
         return -1;
 
-    /* Stash the old VM so we can free it after switching away from it. */
+    /* Stash the old VM so we can free it after switching away from it.
+     * The old image/stack/sigpage AND any mmap regions live on
+     * self->vma_list; detach the whole list aside so uvm_setup_image()
+     * can build the new image's VMAs on a fresh, empty list. */
     unsigned long *old_pgd = self->pgd;
     void *old_image = self->image_base;
     void *old_stack = self->user_stack_base;
     void *old_sig   = self->sigpage_base;
+    struct list_head old_vmas;
+    INIT_LIST_HEAD(&old_vmas);
+    vma_detach_all(self, &old_vmas);
 
     /* Point self at the new PGD, then map the image into it (this also
      * installs a fresh signal page via uvm_setup_image). On failure
-     * restore the old bookkeeping and tear the new PGD down. */
+     * restore the old bookkeeping (including the detached VMA list) and
+     * tear the new PGD down. */
     self->pgd = new_pgd;
     self->image_base = NULL;
     self->user_stack_base = NULL;
     self->sigpage_base = NULL;
     if (uvm_setup_image(self, src, sz) != 0) {
+        /* uvm_setup_image rolls back all-or-nothing: on failure it leaves
+         * self->vma_list empty and frees its own blocks. Restore the old
+         * bookkeeping and move the detached old VMA list back onto self. */
         self->pgd = old_pgd;
         self->image_base = old_image;
         self->user_stack_base = old_stack;
         self->sigpage_base = old_sig;
+        vma_reattach(self, &old_vmas);
         pgd_free(new_pgd);
         return -1;
     }
 
-    /* Switch to the new address space, then reclaim the old one via the
-     * saved pointers (satp no longer points at it). */
+    /* Switch to the new address space, then reclaim the old one. The old
+     * VMA list owns the old image/stack/sigpage/mmap frame blocks; free
+     * them all via the detached list (satp no longer points at old_pgd). */
     mm_set_satp(new_pgd);
-    if (old_image)
-        buddy_free(old_image);
-    if (old_stack)
-        buddy_free(old_stack);
-    if (old_sig)
-        buddy_free(old_sig);
+    vma_free_list(&old_vmas);
     pgd_free(old_pgd);
 
     /* POSIX: exec resets handlers to default and drops pending. The
@@ -211,6 +221,104 @@ static long sys_exec(const char *path, struct trap_frame *tf)
     tf->s8 = tf->s9 = tf->s10 = tf->s11 = 0;
 
     return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief fork_copy_vmas() – Build the child's VMA list during fork.
+ *
+ * Registers the three fixed regions (image/stack/sigpage, is_mmap=0) whose
+ * frames @par already duplicated, then walks @par->vma_list and, for every
+ * mmap VMA (is_mmap==1), allocates a private copy of the backing frames,
+ * copies the parent's bytes in, maps them at the SAME user VA in ch->pgd,
+ * and records a child VMA. POSIX fork semantics: anonymous mappings are
+ * inherited as private copies.
+ *
+ * All-or-nothing: on any failure every node/block this function linked or
+ * allocated is released and ch->vma_list is left empty, so the caller's
+ * rollback (which still owns img/stk/sig directly) does not double-free.
+ * @param par       Parent thread (source VMAs).
+ * @param ch        Child thread (empty vma_list, valid ch->pgd).
+ * @param img       Child image block (already duplicated + mapped).
+ * @param img_bytes Image mapped length.
+ * @param stk       Child stack block (already duplicated + mapped).
+ * @param stk_bytes Stack mapped length.
+ * @param sig       Child signal page (already allocated + mapped).
+ * @return 0 on success, -1 on OOM (nothing left linked).
+ * -------------------------------------------------------------------- */
+static int fork_copy_vmas(struct thread *par, struct thread *ch,
+                          void *img, unsigned long img_bytes,
+                          void *stk, unsigned long stk_bytes, void *sig)
+{
+    /*
+     * Allocate the three fixed-region nodes up front but do NOT link them
+     * yet. They reference the caller-owned img/stk/sig blocks; if anything
+     * below fails we kfree only the nodes, leaving those blocks for the
+     * caller's rollback to free (no double free).
+     */
+    struct vma *vi = vma_alloc(USER_CODE_VA, img_bytes,
+                               PROT_USER_RWX, img, 0);
+    struct vma *vs = vma_alloc(USER_STACK_TOP - stk_bytes, stk_bytes,
+                               PROT_USER_DATA, stk, 0);
+    struct vma *vg = vma_alloc(SIGPAGE_VA, PAGE_SIZE,
+                               PROT_USER_RWX, sig, 0);
+    if (!vi || !vs || !vg)
+        goto fail_nodes;
+
+    /*
+     * Copy each parent mmap region into a private child copy, accumulating
+     * onto a local list. Keeping these separate from ch->vma_list until the
+     * end means a mid-loop failure frees ONLY these copies (their own
+     * blocks), never the fixed-region blocks the caller still owns.
+     */
+    struct list_head copies;
+    INIT_LIST_HEAD(&copies);
+
+    struct list_head *it;
+    list_for_each(it, &par->vma_list) {
+        struct vma *pv = list_entry(it, struct vma, link);
+        if (!pv->is_mmap)
+            continue;
+
+        void *nkva = buddy_alloc(pv->len);
+        if (!nkva)
+            goto fail_copies;
+        mem_cpy(nkva, pv->kva, pv->len);
+
+        if (map_pages(ch->pgd, pv->va, pv->len,
+                      virt_to_phys(nkva), pv->prot) != 0) {
+            buddy_free(nkva);
+            goto fail_copies;
+        }
+        struct vma *nv = vma_alloc(pv->va, pv->len, pv->prot, nkva, 1);
+        if (!nv) {
+            buddy_free(nkva);
+            goto fail_copies;
+        }
+        list_add_tail(&nv->link, &copies);
+    }
+
+    /* All allocations succeeded: link everything into ch->vma_list. From
+     * here the child owns the img/stk/sig blocks via vi/vs/vg. */
+    vma_insert_sorted(ch, vi);
+    vma_insert_sorted(ch, vs);
+    vma_insert_sorted(ch, vg);
+    while (!list_empty(&copies)) {
+        struct vma *v = list_entry(copies.next, struct vma, link);
+        list_del(&v->link);
+        vma_insert_sorted(ch, v);
+    }
+    return 0;
+
+fail_copies:
+    vma_free_list(&copies);        /* free mmap copies' blocks + nodes */
+fail_nodes:
+    if (vi)
+        kfree(vi);
+    if (vs)
+        kfree(vs);
+    if (vg)
+        kfree(vg);
+    return -1;
 }
 
 /** ----------------------------------------------------------------------
@@ -256,6 +364,9 @@ static long sys_fork(struct trap_frame *tf)
         goto fail_pgd;
     mem_cpy(img, par->image_base, img_bytes);
     asm volatile ("fence.i" ::: "memory");
+    if (map_pages(ch->pgd, USER_CODE_VA, img_bytes,
+                  virt_to_phys(img), PROT_USER_RWX) != 0)
+        goto fail_img;
 
     /* 3) Duplicate the stack frames likewise. */
     unsigned long stk_bytes = par->user_stack_size;
@@ -263,10 +374,6 @@ static long sys_fork(struct trap_frame *tf)
     if (!stk)
         goto fail_img;
     mem_cpy(stk, par->user_stack_base, stk_bytes);
-
-    if (map_pages(ch->pgd, USER_CODE_VA, img_bytes,
-                  virt_to_phys(img), PROT_USER_RWX) != 0)
-        goto fail_stk;
     if (map_pages(ch->pgd, USER_STACK_TOP - stk_bytes, stk_bytes,
                   virt_to_phys(stk), PROT_USER_DATA) != 0)
         goto fail_stk;
@@ -288,6 +395,19 @@ static long sys_fork(struct trap_frame *tf)
     ch->user_stack_base = stk;
     ch->user_stack_size = stk_bytes;
     ch->sigpage_base    = sig;
+    /* Inherit the parent's placement cursor so the child's future mmaps
+     * land below the regions it inherited (copied below), not on top. */
+    ch->mmap_top        = par->mmap_top;
+
+    /*
+     * 3c) Register the three fixed regions as the child's VMAs (is_mmap=0)
+     *     and then copy every mmap VMA from the parent. After this point
+     *     the child's frame blocks are owned by ch->vma_list, so failures
+     *     unwind via vma_unmap_all(ch) (fail_vmas) — NOT the per-block
+     *     buddy_free paths, which would double-free.
+     */
+    if (fork_copy_vmas(par, ch, img, img_bytes, stk, stk_bytes, sig) != 0)
+        goto fail_sig;
 
     /* 4) Plant child's trap_frame at the top of its kstack. The child
      *    keeps the parent's user sp VERBATIM: parent and child share an
@@ -417,9 +537,10 @@ static void sys_exit(long status)
 
     /*
      * Do NOT free the user address space here: satp still points at
-     * self->pgd. The reaper (kill_zombies) frees the image/stack frames
-     * and the page tables after schedule() has switched satp away. Only
-     * the sigstack (kernel-side, not in the user VM) is released now.
+     * self->pgd. The reaper (kill_zombies) frees the image/stack frames,
+     * the signal page and the page tables after schedule() has switched
+     * satp away. signal_release() only clears the in_handler gate so a
+     * thread dying mid-handler leaves a clean signal state.
      */
     signal_release(self);
 
@@ -592,6 +713,24 @@ static long sys_sigreturn(struct trap_frame *tf)
 }
 
 /** ----------------------------------------------------------------------
+ * @brief sys_mmap() – Map an anonymous memory region into the caller.
+ *
+ * Thin wrapper that forwards to do_mmap() on the current thread. The
+ * return value (a user base VA, or MAP_FAILED == (void*)-1 on error) is
+ * delivered through tf->a0 by trap.c. Only anonymous, eager mappings are
+ * supported; fd/offset are absent from the ABI.
+ * @param addr   Placement hint (NULL → kernel chooses).
+ * @param length Requested byte length (page-rounded by do_mmap).
+ * @param prot   User PROT_* bits.
+ * @param flags  User MAP_* bits (MAP_ANONYMOUS required).
+ * @return User base VA on success, MAP_FAILED on failure, both as long.
+ * -------------------------------------------------------------------- */
+static long sys_mmap(void *addr, unsigned long length, int prot, int flags)
+{
+    return (long)do_mmap(get_current(), addr, length, prot, flags);
+}
+
+/** ----------------------------------------------------------------------
  * @brief do_syscall() – Decode tf->a7 and dispatch to the handler.
  *
  * Unknown syscall numbers return -1 so user space can detect them.
@@ -629,6 +768,9 @@ long do_syscall(struct trap_frame *tf)
         return sys_sigreturn(tf);
     case SYS_KILL:
         return sys_kill((int)tf->a0, (int)tf->a1);
+    case SYS_MMAP:
+        return sys_mmap((void *)tf->a0, (unsigned long)tf->a1,
+                        (int)tf->a2, (int)tf->a3);
     default:
         return -1;
     }

@@ -6,8 +6,8 @@
 #include "signal.h"
 
 /*
- * Cooperative kernel-thread scheduler (Lab5 Basic Ex1) extended with
- * user-process abstractions for Lab5 Basic Ex2.
+ * Cooperative kernel-thread scheduler extended with user-process
+ * abstractions.
  *
  * Each thread owns a private kernel stack and a context block holding
  * callee-saved registers plus ra/sp. switch_to() in switch.S persists
@@ -70,7 +70,7 @@ struct thread {
     struct list_head  sibling;          /* node in parent->children */
     int               exit_status;
 
-    /* ---------------- Lab6 Ex2: per-process address space ------------- */
+    /* ---------------- Per-process address space ----------------------- */
 
     /*
      * Root page table (kernel VA) of this process's private Sv39 address
@@ -113,6 +113,23 @@ struct thread {
      * (their pending bitmap stays 0 so signal_check_and_dispatch is a
      * no-op even if it is ever reached on a non-user path). */
     struct signal_state sig;
+
+    /* ---------------- mmap regions ------------------------------------ */
+
+    /*
+     * All user virtual-memory areas of this process (image, stack, signal
+     * page, and every mmap()'d region), kept va-ascending. Replaces the
+     * ad-hoc image_base/user_stack_base bookkeeping for *enumeration* and
+     * teardown; those fields are retained for fast image memcpy on fork.
+     */
+    struct list_head vma_list;
+
+    /*
+     * Top-down cursor for addr==NULL mmap placement. Initialised below the
+     * stack region; each anonymous mapping is carved downward from here so
+     * mmap regions never collide with the fixed image (low) / stack (high).
+     */
+    unsigned long mmap_top;
 };
 
 /* User stack size attached after every user image. */

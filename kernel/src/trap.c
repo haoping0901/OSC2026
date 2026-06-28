@@ -23,10 +23,10 @@ _Static_assert(sizeof(struct trap_frame) == TF_SIZE,
 
 /*
  * Diagnostic base subtracted from sepc when printing an unhandled-trap
- * report. Under Lab6 Ex2 every user image is mapped at USER_CODE_VA (0)
- * in its own address space, so the user VA already IS the program-
- * relative offset and this stays 0. Retained (with trap_set_user_base())
- * for callers that may want a non-zero base in future.
+ * report. Every user image is mapped at USER_CODE_VA (0) in its own
+ * address space, so the user VA already IS the program-relative offset
+ * and this stays 0. Retained (with trap_set_user_base()) for callers
+ * that may want a non-zero base in future.
  */
 static uintptr_t g_user_base = 0;
 
@@ -75,7 +75,7 @@ void trap_init(void)
     asm volatile ("csrw sscratch, %0" :: "r"(0UL));
 
     /*
-     * Lab6 Ex2: permit S-mode to read/write user pages. Syscalls such as
+     * Permit S-mode to read/write user pages. Syscalls such as
      * sys_uart_write / sys_display dereference user buffers (PTE_U pages)
      * while in S-mode; without sstatus.SUM the hardware would fault on
      * those accesses. We keep SUM set for the whole kernel lifetime —
@@ -119,14 +119,14 @@ void trap_handler(struct trap_frame *tf)
         task_run_pending();
 
         /*
-         * Preemption gate (Lab5 Basic Ex2): if a timer tick set the
-         * need_resched flag and we are returning to U-mode, yield to
-         * the next runnable thread. We do this here (trap context)
-         * rather than inside the IRQ handler so that switch_to() can
-         * safely change kernel stacks. SPP=0 means the trap was
-         * taken from U-mode, which is the only case where we want to
-         * preempt — preempting kernel threads would break the lab's
-         * cooperative semantics for kernel-only paths.
+         * Preemption gate: if a timer tick set the need_resched flag
+         * and we are returning to U-mode, yield to the next runnable
+         * thread. We do this here (trap context) rather than inside the
+         * IRQ handler so that switch_to() can safely change kernel
+         * stacks. SPP=0 means the trap was taken from U-mode, which is
+         * the only case where we want to preempt — preempting kernel
+         * threads would break the lab's cooperative semantics for
+         * kernel-only paths.
          */
         if (need_resched_clear()
             && (tf->sstatus & SSTATUS_SPP) == 0)
@@ -169,6 +169,17 @@ void trap_handler(struct trap_frame *tf)
      * worrying about where kmalloc() happened to place the image.
      */
     uintptr_t rel_sepc = tf->sepc - g_user_base;
+
+    /*
+     * Re-enable SIE before printing the diagnostic. Hardware clears
+     * sstatus.SIE on trap entry, but uart_puts() routes through the
+     * IRQ-driven TX ring and blocks waiting for a TX-complete interrupt;
+     * with SIE still 0 that interrupt can never fire and the print would
+     * hang (first observed when the mmap tests deliberately fault a
+     * read-only / out-of-bounds page). We are about to halt anyway, so
+     * re-arming interrupts here is harmless.
+     */
+    asm volatile ("csrs sstatus, %0" :: "r"((unsigned long)SSTATUS_SIE));
 
     uart_puts("=== S-Mode trap ===\n");
     uart_puts("scause: ");

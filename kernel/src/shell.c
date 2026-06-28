@@ -43,7 +43,7 @@ static void shell_print_help(void)
     uart_puts("  kill <pid> <signum> - post a POSIX signal to a user process.\n");
 }
 
-/* ---------- threadtest (Lab5 Basic Ex1: cooperative threads) ----------- */
+/* ---------- threadtest (cooperative threads) --------------------------- */
 
 /** ----------------------------------------------------------------------
  * @brief demo_thread_body() – Worker body for the threadtest demo.
@@ -331,7 +331,7 @@ static void shell_kill_pid(const char *args)
     uart_puts("\n");
 }
 
-/* ---------- Lab 3 test case --------------------------------------------- */
+/* ---------- Memory allocator test case --------------------------------- */
 
 static void test_alloc_1(void)
 {

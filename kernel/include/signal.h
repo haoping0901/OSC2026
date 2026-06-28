@@ -7,7 +7,7 @@
 struct thread;
 
 /*
- * Lab5 Advanced Exercise — POSIX-style asynchronous signal delivery.
+ * POSIX-style asynchronous signal delivery.
  *
  * Each user thread owns a struct signal_state that tracks:
  *   - pending signals as a 32-bit bitmap;

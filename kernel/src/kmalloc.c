@@ -61,7 +61,7 @@ static int find_pool(unsigned long size)
  * Convert a buddy pointer to a page-frame index (relative to buddy base).
  *
  * Buddy hands out linear-map VAs while its base is a PA, so map the VA back
- * to a PA before computing the frame index (Lab6 higher-half paging).
+ * to a PA before computing the frame index (higher-half paging).
  */
 static inline unsigned long ptr_to_page_idx(void *ptr)
 {

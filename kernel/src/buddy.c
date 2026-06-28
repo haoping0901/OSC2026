@@ -8,7 +8,7 @@
 /*
  * Compile-time switch for the noisy per-page trace lines prefixed with
  * "[+]" / "[-]" / "[*]". Leave undefined to silence them (default); define
- * to re-enable the verbose pool build / merge traces used during Lab 3.
+ * to re-enable the verbose pool build / merge traces.
  */
 /* #define BUDDY_VERBOSE_LOG */
 
@@ -53,7 +53,7 @@ static inline unsigned long addr_to_idx(uintptr_t addr)
 }
 
 /*
- * PA <-> pointer bridge (Lab6 higher-half paging).
+ * PA <-> pointer bridge (higher-half paging).
  *
  * The buddy allocator keeps ALL of its bookkeeping in physical addresses
  * (idx_to_addr/addr_to_idx, g_buddy_base/end, reserves), preserving each

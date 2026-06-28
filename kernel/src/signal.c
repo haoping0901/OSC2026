@@ -11,7 +11,7 @@
 #include "buddy.h"
 
 /*
- * Lab5 Advanced Exercise — POSIX signal core.
+ * POSIX signal core.
  *
  * Dispatch model (no nesting): one user-mode handler may be active per
  * thread at a time. signal_check_and_dispatch() snapshots the entire
@@ -132,10 +132,10 @@ void signal_default_terminate(struct thread *t)
     struct thread *par = t->parent;
     sie_restore(flags);
 
-    /* The user address space (image/stack frames + page tables) is
-     * reclaimed by the reaper, after satp has switched away from this
-     * thread's PGD; freeing it here would risk tearing down the live
-     * satp root. Only the kernel-side sigstack is released now. */
+    /* The user address space (image/stack frames + signal page + page
+     * tables) is reclaimed by the reaper, after satp has switched away
+     * from this thread's PGD; freeing it here would risk tearing down the
+     * live satp root. signal_release() only clears the in_handler gate. */
     signal_release(t);
 
     if (par)

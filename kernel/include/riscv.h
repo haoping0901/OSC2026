@@ -23,7 +23,7 @@
 #define PROT_KERNEL  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D)
 #define PROT_DEVICE  (PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D)
 
-/* ---------- User virtual address layout (Lab6 Basic Ex2) --------------- */
+/* ---------- User virtual address layout --------------------------------- */
 
 /*
  * Fixed user VA layout mandated by the lab spec. Every user process sees
@@ -41,13 +41,13 @@
 #define USER_STACK_TOP    0x0000004000000000UL   /* 0x40_0000_0000 (256 GiB) */
 
 /*
- * Per-process signal page (Lab5 Advanced Ex / Lab6 paging fix). A POSIX
- * signal handler runs in U-mode, so the stack it executes on and the
- * sigreturn trampoline it returns into must be USER virtual addresses
- * carrying PTE_U — a kmalloc'd kernel VA is unreachable from U-mode under
- * Sv39 and would fault on first use. We map one dedicated PROT_USER_RWX
- * page per process to hold both: the trampoline at SIGPAGE_VA (page base)
- * and the handler stack growing down from the page top.
+ * Per-process signal page. A POSIX signal handler runs in U-mode, so
+ * the stack it executes on and the sigreturn trampoline it returns into
+ * must be USER virtual addresses carrying PTE_U — a kmalloc'd kernel VA
+ * is unreachable from U-mode under Sv39 and would fault on first use. We
+ * map one dedicated PROT_USER_RWX page per process to hold both: the
+ * trampoline at SIGPAGE_VA (page base) and the handler stack growing
+ * down from the page top.
  *
  * VPN[2]=255, VPN[1]=0, VPN[0]=0: a PGD slot distinct from the image
  * (VPN[2]=0); it shares PGD slot 255 with the user stack but lives in a

@@ -58,7 +58,7 @@ struct QEMU_PACKED RAMFBCfg {
 };
 
 /*
- * fw_cfg lives in the MMIO aperture below the RAM base. After Lab6 paging
+ * fw_cfg lives in the MMIO aperture below the RAM base. After paging
  * the kernel runs in the higher half, so these registers must be reached
  * through their linear-map VAs (phys_to_virt), not their raw PAs.
  */
@@ -127,7 +127,7 @@ static int mem_ncmp(const char *a, const char *b, int n)
  * caller observe by re-reading the destination buffer.
  * QEMU dereferences the descriptor and the data buffer as guest-physical
  * addresses, so both the buffer and the on-stack descriptor are converted
- * from their kernel VAs back to PAs (Lab6 higher-half paging) before being
+ * from their kernel VAs back to PAs (higher-half paging) before being
  * handed to the device.
  * @param address User buffer (read into / written from).
  * @param length  Bytes to transfer.
@@ -272,7 +272,7 @@ void video_init(void)
 void video_bmp_display(unsigned int *bmp_image, int width, int height)
 {
     /* FB_BASE is the guest-physical aperture handed to QEMU in video_init();
-     * the kernel writes pixels through its linear-map VA (Lab6 paging). */
+     * the kernel writes pixels through its linear-map VA (paging). */
     unsigned int *fb = (unsigned int *)phys_to_virt(FB_BASE);
     int start_x = (FB_WIDTH - width) / 2;
     int start_y = (FB_HEIGHT - height) / 2;

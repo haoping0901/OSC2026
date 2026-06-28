@@ -4,7 +4,7 @@
 #include "trap.h"
 
 /*
- * RISC-V Linux-style syscall ABI used by Lab5 Basic Ex2.
+ * RISC-V Linux-style syscall ABI.
  *   a7        : syscall number
  *   a0..a2    : arguments (only the first three are used by these calls)
  *   a0 (out)  : return value, written back into the trap frame by trap.c
@@ -22,6 +22,7 @@
 #define SYS_SIGNAL      10
 #define SYS_SIGRETURN   11
 #define SYS_KILL        12
+#define SYS_MMAP        13
 
 /** ----------------------------------------------------------------------
  * @brief do_syscall() – Top-level dispatcher for U-mode ecalls.

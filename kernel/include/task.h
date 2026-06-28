@@ -4,7 +4,7 @@
 #include "types.h"
 
 /*
- * Bottom-half task queue (Lab4 Advanced Ex2).
+ * Bottom-half task queue.
  *
  * Device interrupt handlers are split into a top half (run in IRQ
  * context with sstatus.SIE = 0; minimal work, then add_task()) and a

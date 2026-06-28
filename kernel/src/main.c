@@ -28,7 +28,7 @@ static void reserve_startup_region(uintptr_t base, uintptr_t size)
 
 int main(unsigned long hart_id, void *dtb_ptr)
 {
-    /* Lab6: start.S hands us physical addresses (DTB pointer in a1, device
+    /* start.S hands us physical addresses (DTB pointer in a1, device
      * bases resolved from the DTB are PAs). Paging is on and the kernel runs
      * in the higher half, so every PA we dereference or feed to a driver is
      * routed through phys_to_virt() here — keeping the PA->VA boundary in
@@ -184,7 +184,7 @@ int main(unsigned long hart_id, void *dtb_ptr)
     timer_init();
     uart_puts("[Timer] Core timer interrupt enabled.\n");
 
-    /* Step 13.5: Register the QEMU ramfb framebuffer (Lab5 Basic Ex3).
+    /* Step 13.5: Register the QEMU ramfb framebuffer.
      * Done after timer_init() so all earlier subsystems are live; if
      * fw_cfg/ramfb is unavailable we just print a warning instead of
      * panicking — boards without ramfb should keep booting normally. */
@@ -194,9 +194,9 @@ int main(unsigned long hart_id, void *dtb_ptr)
     uart_puts(".\n");
 
     /* Step 14: Adopt the boot context as the bootstrap thread and
-     * spawn the idle thread (Lab5 Basic Ex1). After this point any
-     * code running on the main path is "the bootstrap thread"; any
-     * future thread_create()/schedule() call composes correctly. */
+     * spawn the idle thread. After this point any code running on the
+     * main path is "the bootstrap thread"; any future
+     * thread_create()/schedule() call composes correctly. */
     sched_init();
     uart_puts("[Sched] bootstrap + idle thread ready.\n");
 
