@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "sched.h"
 #include "signal.h"
+#include "mm.h"
 
 /* UART0 IRQ id (from DTB). Set via trap_set_uart_irq() before SEIE. */
 static unsigned int g_uart_irq;
@@ -109,7 +110,7 @@ void trap_handler(struct trap_frame *tf)
             if (irq == g_uart_irq && irq != 0) {
                 /* UART defers plic_complete() to its bottom half so
                  * the source stays masked at the PLIC until the BH
-                 * unmasks it (lab spec: "unmask at task completion"). */
+                 * unmasks it at task completion. */
                 uart_top_half(irq);
             } else if (irq != 0) {
                 plic_complete(irq);
@@ -125,8 +126,8 @@ void trap_handler(struct trap_frame *tf)
          * IRQ handler so that switch_to() can safely change kernel
          * stacks. SPP=0 means the trap was taken from U-mode, which is
          * the only case where we want to preempt — preempting kernel
-         * threads would break the lab's cooperative semantics for
-         * kernel-only paths.
+         * threads would break the cooperative semantics kernel-only
+         * paths rely on.
          */
         if (need_resched_clear()
             && (tf->sstatus & SSTATUS_SPP) == 0)
@@ -161,6 +162,26 @@ void trap_handler(struct trap_frame *tf)
          * deliver one pending signal before resuming user code. */
         deliver_pending_signal(tf);
         return;
+    }
+
+    if (cause == EXC_INST_PAGE_FAULT || cause == EXC_LOAD_PAGE_FAULT ||
+        cause == EXC_STORE_PAGE_FAULT) {
+        /*
+         * Demand paging: a fault inside a valid VMA is populated and 0 is
+         * returned — sepc is deliberately NOT advanced, so the sret below
+         * retries the faulting instruction (the essential difference from
+         * the ecall +4 path). This also covers S-mode faults: a syscall
+         * dereferencing an untouched user buffer (via sstatus.SUM) traps
+         * through .Lfrom_kernel and resumes mid-syscall after populate.
+         * A U-mode segfault never returns (do_page_fault kills the
+         * process); only a kernel-mode fault outside every VMA — a kernel
+         * bug — returns -1 and falls through to the diagnostic halt.
+         */
+        if (do_page_fault(tf) == 0) {
+            if ((tf->sstatus & SSTATUS_SPP) == 0)
+                deliver_pending_signal(tf);
+            return;
+        }
     }
 
     /*
@@ -199,11 +220,12 @@ void trap_handler(struct trap_frame *tf)
 }
 
 /** ----------------------------------------------------------------------
- * @brief kernel_trap_panic() – Fatal handler for S→S traps in Ex1.
+ * @brief kernel_trap_panic() – Fatal handler for unexpected S→S traps.
  *
- * Basic Ex1 does not expect any trap to be taken while the kernel is
- * already running. If one occurs, the assembly trampoline jumps here
- * so that the operator sees a clear message before the hart spins.
+ * Legacy path for configurations where no trap is expected while the
+ * kernel is already running. If one occurs, the assembly trampoline
+ * jumps here so that the operator sees a clear message before the hart
+ * spins.
  * -------------------------------------------------------------------- */
 void kernel_trap_panic(void)
 {

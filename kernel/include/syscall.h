@@ -36,4 +36,16 @@
  * -------------------------------------------------------------------- */
 long do_syscall(struct trap_frame *tf);
 
+/** ----------------------------------------------------------------------
+ * @brief do_exit() – Terminate the current process (never returns).
+ *
+ * Core of SYS_EXIT, exported so the page-fault handler can kill a
+ * process on segmentation fault through the exact same teardown path
+ * (reparent children, mark ZOMBIE, release signal state, wake parent,
+ * schedule away). The user VM is reclaimed later by the reaper, once
+ * satp has switched off the dying PGD.
+ * @param status Exit status returned to the parent's waitpid.
+ * -------------------------------------------------------------------- */
+void do_exit(long status) __attribute__((noreturn));
+
 #endif /* __SYSCALL_H__ */

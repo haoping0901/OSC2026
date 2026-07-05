@@ -85,11 +85,13 @@ int map_pages(unsigned long *pgd, unsigned long va, unsigned long size,
               unsigned long pa, unsigned long prot);
 
 /**
- * uvm_destroy() - free the user (low) half page tables of @pgd.
+ * uvm_destroy() - free the user (low) half of @pgd, frames included.
  *
- * Walks PGD indices 0..KERNEL_PGD_HALF-1 and frees every intermediate
- * PMD/PTE table. Leaf user frames are NOT freed here (they are owned by
- * the thread's image_base/stack bookkeeping). The shared kernel high
+ * Walks PGD indices 0..KERNEL_PGD_HALF-1 and frees every mapped user
+ * frame (each valid leaf PTE) before freeing the intermediate PMD/PTE
+ * tables. Under demand paging the page table is the single owner of
+ * user frames (VMAs are pure metadata), so this is the one place leaf
+ * frames are returned to the buddy allocator. The shared kernel high
  * half is never touched.
  */
 void uvm_destroy(unsigned long *pgd);
@@ -112,7 +114,7 @@ void mm_set_satp(unsigned long *pgd_va);
 /* ---------- mmap (anonymous memory) ------------------------------------ */
 
 /*
- * mmap prot bits (user ABI, lab spec). These are USER-facing values, NOT
+ * mmap prot bits (user ABI). These are USER-facing values, NOT
  * PTE flags; mmap_prot_to_pte() converts them to Sv39 leaf flags. Do not
  * confuse with the kernel-side PROT_USER_* sets in riscv.h.
  */
@@ -121,8 +123,8 @@ void mm_set_satp(unsigned long *pgd_va);
 #define PROT_WRITE  0x2
 #define PROT_EXEC   0x4
 
-/* mmap flags (user ABI, lab spec). Only MAP_ANONYMOUS is honoured; this
- * implementation is eager so MAP_POPULATE is implied (no demand paging). */
+/* mmap flags (user ABI). Only MAP_ANONYMOUS is honoured;
+ * mappings are demand-paged and MAP_POPULATE is accepted but ignored. */
 #define MAP_ANONYMOUS  0x20
 #define MAP_POPULATE   0x8000
 
@@ -141,30 +143,80 @@ void mm_set_satp(unsigned long *pgd_va);
 /*
  * One contiguous user virtual-memory area. Every user region (loaded
  * image, stack, signal page, and each mmap result) is described by one
- * vma linked into thread->vma_list, ordered by ascending va. The backing
- * frames are a single buddy block at kva; map_pages() installs true 4 KiB
- * leaves over [va, va+len) carrying prot.
+ * vma linked into thread->vma_list, ordered by ascending va.
+ *
+ * VMAs are pure metadata (range + permissions + optional file backing):
+ * frames are allocated one page at a time by the page-fault handler and
+ * owned by the page table (freed in uvm_destroy()), never by the VMA.
+ * file_src/file_len describe the initrd bytes backing an image region;
+ * initrd lives in reserved memory, so the pointer stays valid for the
+ * whole process lifetime and across fork.
  */
 struct vma {
     struct list_head link;      /* node in thread->vma_list (va-ascending) */
     unsigned long    va;        /* user virtual base (PAGE_SIZE aligned)    */
     unsigned long    len;       /* byte length (PAGE_SIZE aligned)          */
     unsigned long    prot;      /* leaf PTE flag bits already incl. PTE_U   */
-    void            *kva;       /* kernel VA of the buddy block backing it  */
+    const void      *file_src;  /* initrd bytes backing it; NULL if anon    */
+    unsigned long    file_len;  /* bytes available at file_src              */
     unsigned char    is_mmap;   /* 1 for mmap()'d regions, 0 for img/stk/sig */
 };
 
-struct thread;   /* forward decl: defined in sched.h */
+struct thread;      /* forward decl: defined in sched.h */
+struct trap_frame;  /* forward decl: defined in trap.h  */
 
 /**
  * vma_alloc() - allocate and populate a struct vma.
  *
  * kmalloc's a vma node and fills every field; the caller links it into a
  * thread via vma_insert_sorted(). @prot must already be leaf PTE flags
- * (incl. PTE_U). Returns NULL on OOM.
+ * (incl. PTE_U). @file_src/@file_len are NULL/0 for anonymous regions.
+ * Returns NULL on OOM.
  */
 struct vma *vma_alloc(unsigned long va, unsigned long len,
-                      unsigned long prot, void *kva, unsigned char is_mmap);
+                      unsigned long prot, const void *file_src,
+                      unsigned long file_len, unsigned char is_mmap);
+
+/**
+ * vma_find() - locate the VMA of @t containing user address @addr.
+ *
+ * Linear scan of t->vma_list for a VMA whose half-open [va, va+len)
+ * interval contains @addr. Returns NULL if no region covers it.
+ */
+struct vma *vma_find(struct thread *t, unsigned long addr);
+
+/**
+ * pt_lookup() - walk @pgd for @va without allocating tables.
+ *
+ * Returns a pointer to the leaf PTE slot for @va, or NULL if any
+ * intermediate table is absent. The slot itself may hold an invalid
+ * PTE; callers test *slot & PTE_V.
+ */
+unsigned long *pt_lookup(unsigned long *pgd, unsigned long va);
+
+/**
+ * do_page_fault() - demand-paging / segfault decision for scause 12/13/15.
+ *
+ * Populates one page and returns 0 when the fault falls inside a VMA
+ * whose prot permits the access (sepc is left untouched so sret retries
+ * the instruction). Kills the current process (never returns) when the
+ * U-mode access is outside every VMA or violates its permissions.
+ * Returns -1 for kernel-mode faults outside any VMA (kernel bug); the
+ * caller falls through to the diagnostic halt path.
+ */
+int do_page_fault(struct trap_frame *tf);
+
+/**
+ * uvm_clone_vma() - fork-time clone of @par's user address space into @ch.
+ *
+ * For every parent VMA: duplicates the metadata node (including file
+ * backing) onto ch->vma_list, then copies only the pages the parent has
+ * actually populated into fresh frames mapped at the same user VA in
+ * ch->pgd. Untouched pages are left to fault in the child on demand.
+ * On failure the partially built state stays on @ch; the caller rolls
+ * back with vma_free_list(&ch->vma_list) + pgd_free(ch->pgd).
+ */
+int uvm_clone_vma(struct thread *ch, struct thread *par);
 
 /**
  * vma_insert_sorted() - link @vma into @t->vma_list keeping va ascending.
@@ -176,11 +228,11 @@ struct vma *vma_alloc(unsigned long va, unsigned long len,
 void vma_insert_sorted(struct thread *t, struct vma *vma);
 
 /**
- * vma_unmap_all() - free every VMA frame block and node of @t.
+ * vma_unmap_all() - free every VMA node of @t.
  *
- * Drains @t->vma_list, buddy_free()s each backing block and kfree()s each
- * node. Page tables / PGD are freed separately by pgd_free(). Must run
- * only when satp no longer points at @t->pgd.
+ * Drains @t->vma_list and kfree()s each node. VMAs are metadata only;
+ * the backing frames are owned by the page table and reclaimed together
+ * with it by pgd_free().
  */
 void vma_unmap_all(struct thread *t);
 
@@ -204,21 +256,21 @@ void vma_detach_all(struct thread *t, struct list_head *dst);
 void vma_reattach(struct thread *t, struct list_head *src);
 
 /**
- * vma_free_list() - free every VMA backing block + node on @head.
+ * vma_free_list() - free every VMA node on @head.
  *
  * Like vma_unmap_all() but over an arbitrary list head (e.g. one filled
- * by vma_detach_all()). Leaves @head empty. Must run only when satp no
- * longer points at the address space those VMAs belonged to.
+ * by vma_detach_all()). Leaves @head empty. Only kfree()s nodes; the
+ * backing frames belong to the page table (see uvm_destroy()).
  */
 void vma_free_list(struct list_head *head);
 
 /**
- * do_mmap() - core of the mmap() syscall (anonymous, eager).
+ * do_mmap() - core of the mmap() syscall (anonymous, demand-paged).
  *
- * Picks a base VA (hint or top-down), allocates and zeroes a backing
- * buddy block, installs 4 KiB leaves carrying the converted prot into
- * @t->pgd, and records a VMA. Returns the user base VA, or MAP_FAILED on
- * bad args / OOM.
+ * Picks a base VA (hint or top-down) and records a metadata-only VMA
+ * carrying the converted prot. No frame is allocated and no PTE is
+ * installed here; the first access page-faults and do_page_fault()
+ * populates one page at a time.
  * @param t      Target (calling) thread; must have a valid t->pgd.
  * @param addr   Placement hint (may be 0 / unaligned / overlapping).
  * @param length Requested byte length (rounded up to a page).

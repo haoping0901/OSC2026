@@ -14,10 +14,10 @@
  * the prev thread's context and reloads the next thread's, then sets
  * tp = next so get_current() observes the switch.
  *
- * For Ex2 a thread is also the unit of process: pid == tid, the
- * parent/children/sibling links form the process tree, and
- * image_base/total_size describe the contiguous user-mode image+stack
- * buffer that thread_spawn_user() / sys_fork() allocate.
+ * A thread is also the unit of process: pid == tid, the
+ * parent/children/sibling links form the process tree, and vma_list
+ * describes the user regions (image/stack/sigpage/mmap) whose frames
+ * are demand-paged into pgd by do_page_fault().
  */
 
 typedef enum {
@@ -82,29 +82,13 @@ struct thread {
     unsigned long    *pgd;
 
     /*
-     * Backing physical frames for the user image and stack, each held by
-     * its contiguous-block kernel VA (buddy_alloc'd):
-     *   image_base       = kernel VA of the image frame block; the user
-     *                      sees it at USER_CODE_VA. Used for memcpy on
-     *                      load/fork and for a single buddy_free on exit.
-     *   image_size       = bytes of program copied in.
-     *   image_pages      = bytes mapped for the image (page-rounded).
-     *   user_stack_base  = kernel VA of the stack frame block; the user
-     *                      sees its top at USER_STACK_TOP.
-     *   user_stack_size  = bytes mapped for the user stack.
-     * All NULL/0 for kernel-only threads.
-     */
-    void             *image_base;
-    unsigned long     image_size;
-    unsigned long     image_pages;
-    void             *user_stack_base;
-    unsigned long     user_stack_size;
-
-    /*
      * Kernel VA backing the per-process signal page mapped at SIGPAGE_VA
      * (PROT_USER_RWX). Holds the sigreturn trampoline (page base) plus the
-     * U-mode handler stack. buddy_alloc'd in uvm_setup_image()/sys_fork(),
-     * reclaimed by thread_free_user_vm() at reap time. NULL for kernel-only
+     * U-mode handler stack. The sigpage is the only eagerly populated
+     * region (signal dispatch writes the trampoline through this kernel
+     * VA); the frame itself is owned by the page table like every other
+     * user frame, so this pointer is a cached alias, not an ownership
+     * handle — teardown never frees through it. NULL for kernel-only
      * threads.
      */
     void             *sigpage_base;
@@ -118,9 +102,9 @@ struct thread {
 
     /*
      * All user virtual-memory areas of this process (image, stack, signal
-     * page, and every mmap()'d region), kept va-ascending. Replaces the
-     * ad-hoc image_base/user_stack_base bookkeeping for *enumeration* and
-     * teardown; those fields are retained for fast image memcpy on fork.
+     * page, and every mmap()'d region), kept va-ascending. Pure metadata:
+     * do_page_fault() consults it to decide populate vs segfault, and
+     * fork clones it; the frames themselves belong to pgd.
      */
     struct list_head vma_list;
 
@@ -163,22 +147,24 @@ void thread_wakeup(struct thread *t);
 struct thread *thread_spawn_user(const char *path);
 
 /*
- * Build @t's user address space for a freshly loaded image: allocate
- * image + stack frame blocks, copy @sz bytes of program from @src into
- * the image block, and map both at the fixed user VAs (image at
- * USER_CODE_VA, stack below USER_STACK_TOP) in @t->pgd. @t->pgd must
- * already be a valid user PGD (pgd_alloc()). On success fills
- * image_base/image_size/image_pages/user_stack_base/user_stack_size and
- * returns 0; on OOM frees whatever it allocated and returns -1.
+ * Build @t's user address space for a freshly loaded image, demand-
+ * paged: register metadata-only VMAs for the image (file-backed by the
+ * initrd bytes at @src, @sz long), the stack and the signal page, and
+ * eagerly populate ONLY the signal page (signal dispatch writes the
+ * trampoline through its kernel VA). No image/stack frame is allocated
+ * here; first touch faults and do_page_fault() populates page by page.
+ * @t->pgd must already be a valid user PGD (pgd_alloc()). Returns 0 on
+ * success; on OOM rolls back and returns -1.
  * Shared by thread_spawn_user() and sys_exec().
  */
 int uvm_setup_image(struct thread *t, const void *src, unsigned long sz);
 
 /*
- * Reclaim @t's user image/stack frames and page tables immediately.
- * Used by sys_exec() to drop the OLD address space AFTER satp has been
- * switched to the new one. Do NOT call on a thread whose PGD is the
- * live satp root.
+ * Reclaim @t's user VM immediately: VMA metadata nodes, then the page
+ * tables + every mapped user frame (owned by the page table) + the PGD.
+ * Used by the reaper and by sys_exec() to drop the OLD address space
+ * AFTER satp has been switched to the new one. Do NOT call on a thread
+ * whose PGD is the live satp root.
  */
 void thread_free_user_vm(struct thread *t);
 

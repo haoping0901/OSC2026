@@ -214,10 +214,10 @@ void thread_wakeup(struct thread *t)
  * @brief sched_zombify() – Move @t onto the zombie list for reaping.
  *
  * The idle thread's kill_zombies() pass will free both the kernel
- * stack and the thread struct. Caller MUST already have:
+ * stack and the thread struct (plus the user VM via
+ * thread_free_user_vm()). Caller MUST already have:
  *   - detached @t from runq / parent->children;
- *   - set @t->state = THREAD_ZOMBIE;
- *   - freed @t->image_base if any.
+ *   - set @t->state = THREAD_ZOMBIE.
  * @param t Thread to schedule for reaping.
  * -------------------------------------------------------------------- */
 void sched_zombify(struct thread *t)
@@ -315,13 +315,13 @@ void thread_exit(void)
 /** ----------------------------------------------------------------------
  * @brief thread_free_user_vm() – Release a process's user VM.
  *
- * Frees every VMA backing block + node via vma_unmap_all() (image, stack,
- * signal page, and all mmap regions are uniform VMAs), then the page
- * tables + PGD (low-half tables via uvm_destroy(), then the PGD page).
- * The image_base/user_stack_base/sigpage_base pointers are cleared after-
- * ward: they were merely bookkeeping aliases of the now-freed blocks, so
- * leaving them set would dangle. Idempotent: a second call (or a never-
- * spawned kernel thread with an empty vma_list) is a no-op.
+ * Frees the VMA metadata nodes via vma_unmap_all(), then pgd_free()
+ * reclaims every mapped user frame together with the page tables and
+ * the PGD (single-owner model: the page table owns the frames).
+ * sigpage_base is cleared afterward: it was only a cached alias of a
+ * frame pgd_free() just released, so leaving it set would dangle.
+ * Idempotent: a second call (or a never-spawned kernel thread with an
+ * empty vma_list) is a no-op.
  *
  * MUST be called only from a context where satp no longer points at
  * @t->pgd — i.e. the reap point (kill_zombies), or sys_exec() AFTER it
@@ -330,12 +330,8 @@ void thread_exit(void)
  * -------------------------------------------------------------------- */
 void thread_free_user_vm(struct thread *t)
 {
-    /* VMAs own the image/stack/sigpage/mmap frame blocks; free them here.
-     * The old per-region buddy_free calls are gone to avoid a double free. */
     vma_unmap_all(t);
-    t->image_base      = NULL;
-    t->user_stack_base = NULL;
-    t->sigpage_base    = NULL;
+    t->sigpage_base = NULL;
 
     if (t->pgd) {
         pgd_free(t->pgd);
@@ -422,7 +418,7 @@ void sched_init(void)
     thread_create(idle_thread_body);
 }
 
-/* ---------- Ex2: user-process spawn ------------------------------------- */
+/* ---------- User-process spawn ------------------------------------------ */
 
 /** ----------------------------------------------------------------------
  * @brief plant_initial_frame() – Build a trap_frame at the kstack top.
@@ -492,32 +488,31 @@ static inline unsigned long round_up_page(unsigned long n)
 }
 
 /** ----------------------------------------------------------------------
- * @brief vma_register_fixed() – Record image/stack/sigpage as VMAs.
+ * @brief vma_register_fixed() – Record image/stack/sigpage VMA metadata.
  *
- * Allocates all three vma nodes up front (the only failure point), then
- * links them into t->vma_list with is_mmap=0. All-or-nothing: if any
- * vma_alloc() fails, the already-allocated NODES are kfree'd and the list
- * is left untouched (empty of these three), so the caller's rollback owns
- * the img/stk/sig buddy blocks outright — no double free. prot mirrors the
- * map_pages() flags used for each region.
+ * Allocates all three metadata nodes up front (the only failure point),
+ * then links them into t->vma_list with is_mmap=0. The image VMA is
+ * file-backed by the initrd bytes (@file_src/@file_len) so the fault
+ * handler can page its contents in on demand; stack and sigpage are
+ * anonymous. All-or-nothing: if any vma_alloc() fails, the already-
+ * allocated nodes are kfree'd and the list is left untouched.
  * @param t         Thread to register into (vma_list already INIT'd).
- * @param img       Image block kernel VA.
- * @param img_bytes Image mapped length.
- * @param stk       Stack block kernel VA.
- * @param stk_bytes Stack mapped length.
- * @param sig       Signal page kernel VA.
+ * @param file_src  Program bytes inside the initrd (kernel VA).
+ * @param file_len  Program length in bytes.
+ * @param img_bytes Image region length (page-rounded @file_len).
  * @return 0 on success, -1 on OOM (nothing linked).
  * -------------------------------------------------------------------- */
-static int vma_register_fixed(struct thread *t, void *img,
-                              unsigned long img_bytes, void *stk,
-                              unsigned long stk_bytes, void *sig)
+static int vma_register_fixed(struct thread *t, const void *file_src,
+                              unsigned long file_len,
+                              unsigned long img_bytes)
 {
     struct vma *vi = vma_alloc(USER_CODE_VA, img_bytes,
-                               PROT_USER_RWX, img, 0);
-    struct vma *vs = vma_alloc(USER_STACK_TOP - stk_bytes, stk_bytes,
-                               PROT_USER_DATA, stk, 0);
+                               PROT_USER_RWX, file_src, file_len, 0);
+    struct vma *vs = vma_alloc(USER_STACK_TOP - USER_STACK_SIZE,
+                               USER_STACK_SIZE, PROT_USER_DATA,
+                               NULL, 0, 0);
     struct vma *vg = vma_alloc(SIGPAGE_VA, PAGE_SIZE,
-                               PROT_USER_RWX, sig, 0);
+                               PROT_USER_RWX, NULL, 0, 0);
     if (!vi || !vs || !vg) {
         if (vi)
             kfree(vi);
@@ -534,18 +529,20 @@ static int vma_register_fixed(struct thread *t, void *img,
 }
 
 /** ----------------------------------------------------------------------
- * @brief uvm_setup_image() – Populate a user address space from an image.
+ * @brief uvm_setup_image() – Build a demand-paged user address space.
  *
- * Allocates a page-rounded, physically contiguous image frame block and
- * a stack frame block from the buddy allocator, copies @sz program bytes
- * into the image block, then maps both into @t->pgd at the fixed user
- * VAs: the image at USER_CODE_VA (PROT_USER_RWX, since a raw binary
- * carries no text/data boundary) and the stack just below USER_STACK_TOP
- * (PROT_USER_DATA). The frame blocks stay contiguous in PA so a single
- * buddy_free reclaims each, while map_pages() still installs true 4 KiB
- * leaves. On failure every partial allocation is rolled back.
+ * Registers metadata-only VMAs for the image (file-backed by the initrd
+ * bytes at @src — the initrd sits in reserved memory, so the reference
+ * stays valid for the whole process lifetime), the stack and the signal
+ * page. No image or stack frame is allocated: the first fetch/push
+ * faults and do_page_fault() populates page by page.
+ *
+ * The signal page is the ONE eager region: signal dispatch writes the
+ * sigreturn trampoline through t->sigpage_base (kernel VA), so its
+ * frame must exist before any dispatch. Its ownership still lies with
+ * the page table; sigpage_base is only a cached alias.
  * @param t   Thread with a valid @t->pgd (from pgd_alloc()).
- * @param src Program bytes (kernel VA) to load.
+ * @param src Program bytes inside the initrd (kernel VA).
  * @param sz  Program length in bytes.
  * @return 0 on success, -1 on OOM.
  * -------------------------------------------------------------------- */
@@ -554,73 +551,40 @@ int uvm_setup_image(struct thread *t, const void *src, unsigned long sz)
     unsigned long img_bytes = round_up_page(sz);
     if (img_bytes == 0)                 /* an empty image is meaningless */
         return -1;
-    unsigned long stk_bytes = USER_STACK_SIZE;
 
-    void *img = buddy_alloc(img_bytes);
-    if (!img)
-        return -1;
-    void *stk = buddy_alloc(stk_bytes);
-    if (!stk) {
-        buddy_free(img);
-        return -1;
-    }
     /* Dedicated U-mode signal page: the handler stack + sigreturn
      * trampoline must live at a PTE_U user VA (a kernel VA would fault in
      * U-mode under Sv39). One page suffices because in_handler forbids
-     * nested dispatch. */
+     * nested dispatch. Zeroed so the handler stack never leaks a previous
+     * owner's data. */
     void *sig = buddy_alloc(PAGE_SIZE);
-    if (!sig) {
-        buddy_free(stk);
-        buddy_free(img);
+    if (!sig)
+        return -1;
+    zero_words(sig, PAGE_SIZE);
+
+    if (map_pages(t->pgd, SIGPAGE_VA, PAGE_SIZE,
+                  virt_to_phys(sig), PROT_USER_RWX) != 0) {
+        /* map_pages() failed on an intermediate table, so the sig leaf
+         * was never installed and the frame is still owned here. */
+        uvm_destroy(t->pgd);
+        buddy_free(sig);
         return -1;
     }
 
-    mem_cpy(img, src, sz);
-    asm volatile ("fence.i" ::: "memory");
+    if (vma_register_fixed(t, src, sz, img_bytes) != 0) {
+        /* The sig leaf IS installed now, so uvm_destroy() frees the
+         * frame along with the tables (single-owner model). */
+        uvm_destroy(t->pgd);
+        return -1;
+    }
 
-    if (map_pages(t->pgd, USER_CODE_VA, img_bytes,
-                  virt_to_phys(img), PROT_USER_RWX) != 0)
-        goto fail;
-    if (map_pages(t->pgd, USER_STACK_TOP - stk_bytes, stk_bytes,
-                  virt_to_phys(stk), PROT_USER_DATA) != 0)
-        goto fail;
-    if (map_pages(t->pgd, SIGPAGE_VA, PAGE_SIZE,
-                  virt_to_phys(sig), PROT_USER_RWX) != 0)
-        goto fail;
-
-    /*
-     * Register the three fixed regions as VMAs (is_mmap=0) so teardown,
-     * fork, and in_user_range() treat them uniformly with mmap regions.
-     * All-or-nothing (see vma_register_fixed): on OOM nothing is linked,
-     * so the fail: path's img/stk/sig buddy_free's remain the sole owners.
-     */
-    if (vma_register_fixed(t, img, img_bytes, stk, stk_bytes, sig) != 0)
-        goto fail;
-
-    t->image_base      = img;
-    t->image_size      = sz;
-    t->image_pages     = img_bytes;
-    t->user_stack_base = stk;
-    t->user_stack_size = stk_bytes;
-    t->sigpage_base    = sig;
+    t->sigpage_base = sig;
 
     /* mmap self-selection grows down from one guard page below the signal
      * page, so anonymous regions never collide with image (low) / stack
      * (high) and the topmost region does not abut the signal page. */
     t->mmap_top = MMAP_CURSOR_INIT;
     return 0;
-
-fail:
-    /* No VMA is linked on this path (map_pages failure happens before
-     * registration; vma_register_fixed is all-or-nothing), so the frame
-     * blocks are owned here. Drop the intermediate tables map_pages may
-     * have built and free the three blocks. t->pgd is left valid (high
-     * half intact) for retry or for the caller to pgd_free(). */
-    uvm_destroy(t->pgd);
-    buddy_free(img);
-    buddy_free(stk);
-    buddy_free(sig);
-    return -1;
 }
 
 /** ----------------------------------------------------------------------
@@ -681,7 +645,7 @@ fail_thread:
     return NULL;
 }
 
-/* ---------- Ex2: pid lookup -------------------------------------------- */
+/* ---------- Pid lookup -------------------------------------------------- */
 
 /** ----------------------------------------------------------------------
  * @brief dfs_find_pid() – Recursive search of the process tree.
@@ -726,7 +690,7 @@ struct thread *find_thread_by_pid(int pid)
     return t;
 }
 
-/* ---------- Ex2: preemption flag --------------------------------------- */
+/* ---------- Preemption flag --------------------------------------------- */
 
 void set_need_resched(void)
 {

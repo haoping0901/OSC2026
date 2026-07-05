@@ -4,6 +4,10 @@
 #include "types.h"
 #include "sched.h"   /* struct thread, vma_list / mmap_top */
 #include "kmalloc.h" /* kmalloc / kfree for struct vma */
+#include "trap.h"    /* struct trap_frame for do_page_fault */
+#include "syscall.h" /* do_exit for the segfault-kill path */
+#include "uart.h"    /* fault report prints */
+#include "utils.h"   /* mem_cpy / print_hex_ulong */
 
 /*
  * Early Sv39 page-table setup for the higher-half kernel.
@@ -102,8 +106,8 @@ static inline int pa_is_ram(unsigned long pa)
  * @brief leaf_prot() – Pick PTE flags for a linear-map leaf by PA.
  *
  * RAM gets full kernel RWX; everything else (MMIO apertures and unbacked
- * holes) gets RW without X so device memory is never executable, matching
- * the lab's W^X intent for device regions.
+ * holes) gets RW without X so device memory is never executable (W^X for
+ * device regions).
  * @param pa Physical base address of the 2 MiB leaf.
  * @return PROT_KERNEL for RAM, PROT_DEVICE otherwise.
  * -------------------------------------------------------------------- */
@@ -297,12 +301,42 @@ int map_pages(unsigned long *pgd, unsigned long va, unsigned long size,
 }
 
 /** ----------------------------------------------------------------------
- * @brief uvm_destroy() – Free the user-half intermediate page tables.
+ * @brief pt_lookup() – Non-allocating page-table walk to the leaf slot.
+ *
+ * Descends PGD->PMD->PTE for @va without creating tables. Used by the
+ * fault handler (is the leaf already present?) and by fork (which pages
+ * did the parent actually populate?).
+ * @param pgd Root page table (kernel VA).
+ * @param va  Virtual address to resolve (any offset within the page).
+ * @return Pointer to the leaf PTE slot, or NULL if an intermediate
+ *         table is absent. The slot may hold an invalid PTE; callers
+ *         test *slot & PTE_V.
+ * -------------------------------------------------------------------- */
+unsigned long *pt_lookup(unsigned long *pgd, unsigned long va)
+{
+    unsigned long pte = pgd[PT_INDEX(va, 2)];
+    if (!(pte & PTE_V))
+        return NULL;
+    unsigned long *pmd = phys_to_virt(PTE_TO_PA(pte));
+
+    pte = pmd[PT_INDEX(va, 1)];
+    if (!(pte & PTE_V))
+        return NULL;
+    unsigned long *tbl = phys_to_virt(PTE_TO_PA(pte));
+
+    return &tbl[PT_INDEX(va, 0)];
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uvm_destroy() – Free the user half of @pgd, frames included.
  *
  * Walks the low half (PGD indices 0..KERNEL_PGD_HALF-1): for each valid
- * PGD entry frees its PMD table after freeing every valid PMD entry's
- * PTE table. Leaf user frames are owned and freed by the thread's
- * image/stack bookkeeping, so they are deliberately not freed here. The
+ * PGD entry frees every mapped user frame (valid leaf PTE), then the PTE
+ * table, then the PMD table. Under demand paging the page table is the
+ * single owner of user frames — VMAs are metadata only — so this is the
+ * one teardown path shared by exit-reap, exec replacement and fork
+ * rollback. Every user leaf is an individually buddy_alloc'd 4 KiB page
+ * (no 2 MiB user leaves exist), so per-leaf buddy_free is safe. The
  * shared kernel high half (>= KERNEL_PGD_HALF) is never touched.
  * @param pgd Root page table whose user half is to be freed.
  * -------------------------------------------------------------------- */
@@ -317,6 +351,11 @@ void uvm_destroy(unsigned long *pgd)
             if (!(pmd[j] & PTE_V))
                 continue;
             unsigned long *pte = phys_to_virt(PTE_TO_PA(pmd[j]));
+
+            for (int k = 0; k < PTRS_PER_TABLE; k++) {
+                if (pte[k] & PTE_V)
+                    buddy_free(phys_to_virt(PTE_TO_PA(pte[k])));
+            }
             buddy_free(pte);
         }
         buddy_free(pmd);
@@ -376,27 +415,51 @@ static inline unsigned long mmap_round_up_page(unsigned long n)
  *
  * kmalloc's a node (small object → chunk pool) and fills every field.
  * @prot is already a leaf PTE flag set (incl. PTE_U); it is stored
- * verbatim so teardown and fork copy need no re-conversion.
- * @param va      User virtual base (PAGE_SIZE aligned).
- * @param len     Byte length (PAGE_SIZE aligned).
- * @param prot    Leaf PTE flag bits.
- * @param kva     Kernel VA of the backing buddy block.
- * @param is_mmap 1 for mmap()'d regions, 0 for image/stack/sigpage.
+ * verbatim so the fault handler needs no re-conversion. The node is
+ * pure metadata: no frame is allocated here.
+ * @param va       User virtual base (PAGE_SIZE aligned).
+ * @param len      Byte length (PAGE_SIZE aligned).
+ * @param prot     Leaf PTE flag bits.
+ * @param file_src Initrd bytes backing the region (NULL for anonymous).
+ * @param file_len Bytes available at @file_src.
+ * @param is_mmap  1 for mmap()'d regions, 0 for image/stack/sigpage.
  * @return New vma, or NULL on OOM.
  * -------------------------------------------------------------------- */
 struct vma *vma_alloc(unsigned long va, unsigned long len,
-                      unsigned long prot, void *kva, unsigned char is_mmap)
+                      unsigned long prot, const void *file_src,
+                      unsigned long file_len, unsigned char is_mmap)
 {
     struct vma *v = kmalloc(sizeof(*v));
     if (!v)
         return NULL;
     INIT_LIST_HEAD(&v->link);
-    v->va      = va;
-    v->len     = len;
-    v->prot    = prot;
-    v->kva     = kva;
-    v->is_mmap = is_mmap;
+    v->va       = va;
+    v->len      = len;
+    v->prot     = prot;
+    v->file_src = file_src;
+    v->file_len = file_len;
+    v->is_mmap  = is_mmap;
     return v;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief vma_find() – Locate the VMA of @t containing @addr.
+ *
+ * Linear scan of the (short, va-ascending) vma_list for a half-open
+ * [va, va+len) interval containing @addr.
+ * @param t    Thread whose vma_list to scan.
+ * @param addr User virtual address (any offset within a region).
+ * @return Covering vma, or NULL if @addr is outside every region.
+ * -------------------------------------------------------------------- */
+struct vma *vma_find(struct thread *t, unsigned long addr)
+{
+    struct list_head *it;
+    list_for_each(it, &t->vma_list) {
+        struct vma *v = list_entry(it, struct vma, link);
+        if (addr >= v->va && addr < v->va + v->len)
+            return v;
+    }
+    return NULL;
 }
 
 /** ----------------------------------------------------------------------
@@ -452,8 +515,8 @@ static int vma_overlaps(struct thread *t, unsigned long base,
  * time until a @len-sized hole with no VMA overlap is found, then drops
  * mmap_top one guard page BELOW the chosen base so the next self-selected
  * mapping leaves an unmapped page between regions. The guard page makes a
- * read/write just past a region's end fault (the lab's out-of-bounds test
- * relies on this), and likewise keeps the topmost mmap region from abutting
+ * read/write just past a region's end fault instead of silently hitting a
+ * neighbour, and likewise keeps the topmost mmap region from abutting
  * the signal page (mmap_top is initialised one guard page below SIGPAGE_VA;
  * see MMAP_CURSOR_INIT). USER_CODE_VA (0) is the low bound; running below
  * it means the address space is exhausted.
@@ -511,30 +574,13 @@ static unsigned long mmap_prot_to_pte(int prot)
 }
 
 /** ----------------------------------------------------------------------
- * @brief zero_block() – Clear @bytes of a buddy block word by word.
+ * @brief do_mmap() – Anonymous, demand-paged mmap() core.
  *
- * Anonymous pages must read as zero so a fresh mapping never leaks the
- * previous owner's data. @p is a linear-map kernel VA; @bytes is a
- * PAGE_SIZE multiple.
- * @param p     Block base (kernel VA).
- * @param bytes Length to clear.
- * -------------------------------------------------------------------- */
-static void zero_block(void *p, unsigned long bytes)
-{
-    unsigned long *w = p;
-    for (unsigned long i = 0; i < bytes / sizeof(unsigned long); i++)
-        w[i] = 0;
-}
-
-/** ----------------------------------------------------------------------
- * @brief do_mmap() – Anonymous, eager mmap() core.
- *
- * Validates length, picks a base (hint or top-down), allocates a zeroed
- * buddy block, maps 4 KiB leaves carrying the converted prot into t->pgd,
- * and records a VMA. On any failure after allocation the partial state is
- * rolled back. A final sfence.vma makes the new leaves visible to U-mode
- * before the syscall returns. Demand paging is intentionally not done:
- * the frames are present immediately.
+ * Validates length, picks a base (hint or top-down, guard-page logic in
+ * mmap_find_va() unchanged), and records a metadata-only VMA carrying
+ * the converted prot. No frame is allocated and no PTE is installed, so
+ * no sfence.vma is needed either; the first touch faults and
+ * do_page_fault() populates one zeroed page at a time.
  * @param t      Calling thread (valid t->pgd required).
  * @param addr   Placement hint.
  * @param length Requested length (rounded up to a page).
@@ -556,41 +602,23 @@ void *do_mmap(struct thread *t, void *addr, unsigned long length,
     if (base == 0)
         return MAP_FAILED;
 
-    unsigned long pte_prot = mmap_prot_to_pte(prot);
-
-    void *kva = buddy_alloc(len);
-    if (!kva)
+    struct vma *vma = vma_alloc(base, len, mmap_prot_to_pte(prot),
+                                NULL, 0, 1);
+    if (!vma)
         return MAP_FAILED;
-    zero_block(kva, len);
-
-    if (map_pages(t->pgd, base, len, virt_to_phys(kva), pte_prot) != 0) {
-        buddy_free(kva);
-        return MAP_FAILED;
-    }
-
-    struct vma *vma = vma_alloc(base, len, pte_prot, kva, 1);
-    if (!vma) {
-        /* Leaves were installed but unwinding them needs a teardown that
-         * uvm_destroy() will do at exit; freeing the frame avoids a leak
-         * now while the (orphaned) leaves resolve to nothing referenced. */
-        buddy_free(kva);
-        return MAP_FAILED;
-    }
     vma_insert_sorted(t, vma);
 
-    /* New leaves are live in t->pgd; flush so U-mode sees them at once. */
-    asm volatile ("sfence.vma zero, zero" ::: "memory");
     return (void *)base;
 }
 
 /** ----------------------------------------------------------------------
- * @brief vma_free_list() – Free every VMA backing block + node on a list.
+ * @brief vma_free_list() – Free every VMA node on a list.
  *
- * Drains @head from the front: detaches each node, returns its buddy
- * block, and frees the node itself. Leaves @head empty. Shared by
- * vma_unmap_all() (the thread's live list) and sys_exec() (a detached
- * old list). Must run only when satp no longer points at the owning
- * address space.
+ * Drains @head from the front, kfree()ing each node. Leaves @head
+ * empty. VMAs are pure metadata — the frames they described are owned
+ * by the page table and freed by uvm_destroy()/pgd_free(), the single
+ * teardown path shared by exit-reap, exec and fork rollback (any second
+ * owner here would double-free).
  * @param head List head of VMAs to release.
  * -------------------------------------------------------------------- */
 void vma_free_list(struct list_head *head)
@@ -598,20 +626,15 @@ void vma_free_list(struct list_head *head)
     while (!list_empty(head)) {
         struct vma *v = list_entry(head->next, struct vma, link);
         list_del(&v->link);
-        if (v->kva)
-            buddy_free(v->kva);
         kfree(v);
     }
 }
 
 /** ----------------------------------------------------------------------
- * @brief vma_unmap_all() – Free every VMA backing block + node of @t.
+ * @brief vma_unmap_all() – Free every VMA node of @t.
  *
- * Thin wrapper that drains t->vma_list via vma_free_list(). Covers
- * image/stack/sigpage and all mmap regions uniformly, so
- * thread_free_user_vm() no longer issues the old per-region buddy_free
- * calls (which would double-free). Page tables and the PGD are reclaimed
- * separately by pgd_free().
+ * Thin wrapper that drains t->vma_list via vma_free_list(). Frames and
+ * page tables are reclaimed separately by pgd_free().
  * @param t Thread whose VMAs are to be released.
  * -------------------------------------------------------------------- */
 void vma_unmap_all(struct thread *t)
@@ -665,4 +688,176 @@ void vma_reattach(struct thread *t, struct list_head *src)
     dst->next->prev = dst;
     dst->prev->next = dst;
     INIT_LIST_HEAD(src);
+}
+
+/* ---------- Demand paging ----------------------------------------------- */
+
+/** ----------------------------------------------------------------------
+ * @brief demand_page() – Populate the single page of @v covering @addr.
+ *
+ * Allocates one zeroed 4 KiB frame, fills it from the VMA's file
+ * backing when the faulting page overlaps [0, file_len) (the tail past
+ * file_len stays zero — bss semantics), installs the leaf PTE with the
+ * VMA's prot, and flushes the stale translation for that address only.
+ * fence.i is issued before the mapping goes live so an executable page
+ * is coherent with the I-cache on real silicon.
+ * @param t    Faulting thread (valid t->pgd).
+ * @param v    VMA covering @addr (permission already checked).
+ * @param addr Faulting user VA (any offset within the page).
+ * @return 0 on success, -1 on OOM.
+ * -------------------------------------------------------------------- */
+static int demand_page(struct thread *t, struct vma *v, unsigned long addr)
+{
+    unsigned long page_base = addr & ~(PAGE_SIZE - 1);
+
+    void *frame = buddy_alloc(PAGE_SIZE);
+    if (!frame)
+        return -1;
+    zero_page(frame);
+
+    unsigned long off = page_base - v->va;
+    if (v->file_src && off < v->file_len) {
+        unsigned long n = v->file_len - off;
+        if (n > PAGE_SIZE)
+            n = PAGE_SIZE;
+        mem_cpy(frame, (const char *)v->file_src + off, n);
+    }
+    if (v->prot & PTE_X)
+        asm volatile ("fence.i" ::: "memory");
+
+    if (map_pages(t->pgd, page_base, PAGE_SIZE,
+                  virt_to_phys(frame), v->prot) != 0) {
+        buddy_free(frame);
+        return -1;
+    }
+
+    /* Only this VA's (invalid) translation can be stale; flush it alone. */
+    asm volatile ("sfence.vma %0, zero" :: "r"(page_base) : "memory");
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief do_page_fault() – Demand-populate or kill on scause 12/13/15.
+ *
+ * Decision order:
+ *   1. Kernel-only thread (no pgd) → -1: the caller's diagnostic halt
+ *      path handles what can only be a kernel bug.
+ *   2. Fault outside every VMA, or access type not permitted by the
+ *      covering VMA's prot, or leaf already present (present + faulting
+ *      == permission violation; also breaks any infinite fault loop):
+ *      → segmentation fault. From U-mode the process is killed via
+ *      do_exit(-1) (never returns). From S-mode this means the kernel
+ *      dereferenced a pointer in_user_range() should have rejected —
+ *      a kernel bug — so return -1 to the halt path instead of killing.
+ *   3. Otherwise a legal not-yet-populated page: populate one page and
+ *      return 0. sepc is deliberately left untouched so sret retries
+ *      the faulting instruction — S-mode faults (syscall dereferencing
+ *      an untouched user buffer under SUM) resume mid-syscall the same
+ *      way.
+ *
+ * SIE is re-enabled before any uart print (the IRQ-driven TX ring needs
+ * interrupts; hardware cleared SIE on trap entry) and before the buddy
+ * calls, matching the syscall path's convention.
+ * @param tf Trap frame of the faulting context.
+ * @return 0 populated (retry via sret), -1 kernel bug (caller halts).
+ * -------------------------------------------------------------------- */
+int do_page_fault(struct trap_frame *tf)
+{
+    struct thread *cur = get_current();
+    if (!cur || !cur->pgd)
+        return -1;
+
+    unsigned long addr = tf->stval;
+    struct vma *v = vma_find(cur, addr);
+
+    unsigned long need;
+    if (tf->scause == EXC_INST_PAGE_FAULT)
+        need = PTE_X;
+    else if (tf->scause == EXC_LOAD_PAGE_FAULT)
+        need = PTE_R;
+    else
+        need = PTE_W;
+
+    int violation = (!v || !(v->prot & need));
+    if (!violation) {
+        unsigned long *pte = pt_lookup(cur->pgd, addr);
+        if (pte && (*pte & PTE_V))
+            violation = 1;
+    }
+
+    if (violation) {
+        if (tf->sstatus & SSTATUS_SPP)
+            return -1;      /* S-mode deref outside checks: kernel bug */
+        asm volatile ("csrs sstatus, %0"
+                      :: "r"((unsigned long)SSTATUS_SIE));
+        uart_puts("[Segmentation fault]: Kill Process\n");
+        do_exit(-1);        /* never returns */
+    }
+
+    asm volatile ("csrs sstatus, %0" :: "r"((unsigned long)SSTATUS_SIE));
+    if (demand_page(cur, v, addr) != 0) {
+        /* OOM while paging in: no page to retry on, kill the process. */
+        uart_puts("[Segmentation fault]: Kill Process\n");
+        do_exit(-1);        /* never returns */
+    }
+
+    uart_puts("[Translation fault]: 0x");
+    print_hex_ulong(addr);
+    uart_puts("\n");
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief uvm_clone_vma() – Fork-time per-page clone of @par into @ch.
+ *
+ * For every parent VMA, clones the metadata node (range, prot, file
+ * backing, is_mmap) onto ch->vma_list, then walks the region page by
+ * page and copies ONLY the leaves the parent actually populated into
+ * fresh frames mapped at the same user VA in ch->pgd. Untouched pages
+ * are not copied: the child demand-faults them later from its own
+ * (inherited) VMA, including the file backing. One fence.i after the
+ * loop covers every executable page copied.
+ *
+ * On failure the partially built metadata/frames remain on @ch; the
+ * caller unwinds with vma_free_list(&ch->vma_list) (nodes) +
+ * pgd_free(ch->pgd) (frames + tables) — the same single-owner teardown
+ * as every other path.
+ * @param ch  Child thread (empty vma_list, valid ch->pgd).
+ * @param par Parent thread being forked.
+ * @return 0 on success, -1 on OOM.
+ * -------------------------------------------------------------------- */
+int uvm_clone_vma(struct thread *ch, struct thread *par)
+{
+    struct list_head *it;
+    list_for_each(it, &par->vma_list) {
+        struct vma *pv = list_entry(it, struct vma, link);
+
+        struct vma *nv = vma_alloc(pv->va, pv->len, pv->prot,
+                                   pv->file_src, pv->file_len,
+                                   pv->is_mmap);
+        if (!nv)
+            return -1;
+        vma_insert_sorted(ch, nv);
+
+        for (unsigned long off = 0; off < pv->len; off += PAGE_SIZE) {
+            unsigned long *pte = pt_lookup(par->pgd, pv->va + off);
+            if (!pte || !(*pte & PTE_V))
+                continue;       /* never touched: child faults later */
+
+            void *np = buddy_alloc(PAGE_SIZE);
+            if (!np)
+                return -1;
+            mem_cpy(np, phys_to_virt(PTE_TO_PA(*pte)), PAGE_SIZE);
+
+            if (map_pages(ch->pgd, pv->va + off, PAGE_SIZE,
+                          virt_to_phys(np), pv->prot) != 0) {
+                buddy_free(np);
+                return -1;
+            }
+        }
+    }
+
+    /* Some copied pages are executable; sync the I-cache once. */
+    asm volatile ("fence.i" ::: "memory");
+    return 0;
 }

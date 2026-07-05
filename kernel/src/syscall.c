@@ -32,9 +32,10 @@
  * A valid user buffer must lie wholly inside one mapped region. Since
  * every region (image, stack, signal page, each mmap result) is a VMA on
  * cur->vma_list, the check is a single scan for a VMA whose [va, va+len)
- * contains [a, e). This both rejects stray kernel/MMIO pointers and keeps
- * the kernel from dereferencing an unmapped user VA (which would page-
- * fault in S-mode). Treats overflow as failure.
+ * contains [a, e). This rejects stray kernel/MMIO pointers before the
+ * kernel dereferences them. A pointer inside a VMA may still be un-
+ * populated under demand paging; the S-mode access then page-faults and
+ * do_page_fault() pages it in transparently. Treats overflow as failure.
  *
  * Note: this validates mapping presence only, not prot — a PROT_NONE mmap
  * region passes here but a real access still faults in U-mode. Per-prot
@@ -124,11 +125,12 @@ static long sys_uart_write(const char *buf, long count)
 /** ----------------------------------------------------------------------
  * @brief sys_exec() – Replace the current image with @path from initrd.
  *
- * Looks the file up via cpio, allocates a fresh contiguous image+stack
- * buffer, frees the old one, and rewrites the in-place trap_frame so
- * the impending sret jumps into the new program at offset 0 with a
- * clean register file. Does not create a new thread; the caller's
- * pid stays the same.
+ * Looks the file up via cpio, builds a fresh demand-paged address space
+ * (metadata VMAs + eager sigpage only), and rewrites the in-place
+ * trap_frame so the impending sret jumps into the new program at offset
+ * 0 with a clean register file — the first instruction fetch then
+ * demand-faults the first image page in. Does not create a new thread;
+ * the caller's pid stays the same.
  * @param path Filename inside the initial ramdisk.
  * @param tf   Trap frame on the kernel stack (will be rewritten).
  * @return 0 on success, -1 on lookup / OOM failure.
@@ -149,51 +151,38 @@ static long sys_exec(const char *path, struct trap_frame *tf)
 
     /*
      * Build a brand-new address space rather than mutating the live one.
-     * Snapshot the old VM bookkeeping, install a fresh PGD on a scratch
-     * thread view (we reuse self's fields only after success), then map
-     * the new image. This keeps the running satp/PGD valid until the
-     * switch below, and lets us bail out cleanly on OOM.
+     * This keeps the running satp/PGD valid until the switch below, and
+     * lets us bail out cleanly on OOM.
      */
     unsigned long *new_pgd = pgd_alloc();
     if (!new_pgd)
         return -1;
 
-    /* Stash the old VM so we can free it after switching away from it.
-     * The old image/stack/sigpage AND any mmap regions live on
-     * self->vma_list; detach the whole list aside so uvm_setup_image()
-     * can build the new image's VMAs on a fresh, empty list. */
+    /* Detach the old VMA list aside so uvm_setup_image() can build the
+     * new image's VMAs on a fresh, empty list. The old frames stay owned
+     * by old_pgd's page tables. */
     unsigned long *old_pgd = self->pgd;
-    void *old_image = self->image_base;
-    void *old_stack = self->user_stack_base;
-    void *old_sig   = self->sigpage_base;
+    void *old_sig = self->sigpage_base;
     struct list_head old_vmas;
     INIT_LIST_HEAD(&old_vmas);
     vma_detach_all(self, &old_vmas);
 
-    /* Point self at the new PGD, then map the image into it (this also
-     * installs a fresh signal page via uvm_setup_image). On failure
-     * restore the old bookkeeping (including the detached VMA list) and
-     * tear the new PGD down. */
     self->pgd = new_pgd;
-    self->image_base = NULL;
-    self->user_stack_base = NULL;
     self->sigpage_base = NULL;
     if (uvm_setup_image(self, src, sz) != 0) {
         /* uvm_setup_image rolls back all-or-nothing: on failure it leaves
-         * self->vma_list empty and frees its own blocks. Restore the old
-         * bookkeeping and move the detached old VMA list back onto self. */
+         * self->vma_list empty. Restore the old bookkeeping and move the
+         * detached old VMA list back onto self. */
         self->pgd = old_pgd;
-        self->image_base = old_image;
-        self->user_stack_base = old_stack;
         self->sigpage_base = old_sig;
         vma_reattach(self, &old_vmas);
         pgd_free(new_pgd);
         return -1;
     }
 
-    /* Switch to the new address space, then reclaim the old one. The old
-     * VMA list owns the old image/stack/sigpage/mmap frame blocks; free
-     * them all via the detached list (satp no longer points at old_pgd). */
+    /* Switch to the new address space, then reclaim the old one: node
+     * metadata via the detached list, frames + tables via pgd_free()
+     * (satp no longer points at old_pgd). */
     mm_set_satp(new_pgd);
     vma_free_list(&old_vmas);
     pgd_free(old_pgd);
@@ -224,113 +213,17 @@ static long sys_exec(const char *path, struct trap_frame *tf)
 }
 
 /** ----------------------------------------------------------------------
- * @brief fork_copy_vmas() – Build the child's VMA list during fork.
- *
- * Registers the three fixed regions (image/stack/sigpage, is_mmap=0) whose
- * frames @par already duplicated, then walks @par->vma_list and, for every
- * mmap VMA (is_mmap==1), allocates a private copy of the backing frames,
- * copies the parent's bytes in, maps them at the SAME user VA in ch->pgd,
- * and records a child VMA. POSIX fork semantics: anonymous mappings are
- * inherited as private copies.
- *
- * All-or-nothing: on any failure every node/block this function linked or
- * allocated is released and ch->vma_list is left empty, so the caller's
- * rollback (which still owns img/stk/sig directly) does not double-free.
- * @param par       Parent thread (source VMAs).
- * @param ch        Child thread (empty vma_list, valid ch->pgd).
- * @param img       Child image block (already duplicated + mapped).
- * @param img_bytes Image mapped length.
- * @param stk       Child stack block (already duplicated + mapped).
- * @param stk_bytes Stack mapped length.
- * @param sig       Child signal page (already allocated + mapped).
- * @return 0 on success, -1 on OOM (nothing left linked).
- * -------------------------------------------------------------------- */
-static int fork_copy_vmas(struct thread *par, struct thread *ch,
-                          void *img, unsigned long img_bytes,
-                          void *stk, unsigned long stk_bytes, void *sig)
-{
-    /*
-     * Allocate the three fixed-region nodes up front but do NOT link them
-     * yet. They reference the caller-owned img/stk/sig blocks; if anything
-     * below fails we kfree only the nodes, leaving those blocks for the
-     * caller's rollback to free (no double free).
-     */
-    struct vma *vi = vma_alloc(USER_CODE_VA, img_bytes,
-                               PROT_USER_RWX, img, 0);
-    struct vma *vs = vma_alloc(USER_STACK_TOP - stk_bytes, stk_bytes,
-                               PROT_USER_DATA, stk, 0);
-    struct vma *vg = vma_alloc(SIGPAGE_VA, PAGE_SIZE,
-                               PROT_USER_RWX, sig, 0);
-    if (!vi || !vs || !vg)
-        goto fail_nodes;
-
-    /*
-     * Copy each parent mmap region into a private child copy, accumulating
-     * onto a local list. Keeping these separate from ch->vma_list until the
-     * end means a mid-loop failure frees ONLY these copies (their own
-     * blocks), never the fixed-region blocks the caller still owns.
-     */
-    struct list_head copies;
-    INIT_LIST_HEAD(&copies);
-
-    struct list_head *it;
-    list_for_each(it, &par->vma_list) {
-        struct vma *pv = list_entry(it, struct vma, link);
-        if (!pv->is_mmap)
-            continue;
-
-        void *nkva = buddy_alloc(pv->len);
-        if (!nkva)
-            goto fail_copies;
-        mem_cpy(nkva, pv->kva, pv->len);
-
-        if (map_pages(ch->pgd, pv->va, pv->len,
-                      virt_to_phys(nkva), pv->prot) != 0) {
-            buddy_free(nkva);
-            goto fail_copies;
-        }
-        struct vma *nv = vma_alloc(pv->va, pv->len, pv->prot, nkva, 1);
-        if (!nv) {
-            buddy_free(nkva);
-            goto fail_copies;
-        }
-        list_add_tail(&nv->link, &copies);
-    }
-
-    /* All allocations succeeded: link everything into ch->vma_list. From
-     * here the child owns the img/stk/sig blocks via vi/vs/vg. */
-    vma_insert_sorted(ch, vi);
-    vma_insert_sorted(ch, vs);
-    vma_insert_sorted(ch, vg);
-    while (!list_empty(&copies)) {
-        struct vma *v = list_entry(copies.next, struct vma, link);
-        list_del(&v->link);
-        vma_insert_sorted(ch, v);
-    }
-    return 0;
-
-fail_copies:
-    vma_free_list(&copies);        /* free mmap copies' blocks + nodes */
-fail_nodes:
-    if (vi)
-        kfree(vi);
-    if (vs)
-        kfree(vs);
-    if (vg)
-        kfree(vg);
-    return -1;
-}
-
-/** ----------------------------------------------------------------------
  * @brief sys_fork() – Duplicate the calling process.
  *
- * Allocates a new thread, makes a full memcpy of the parent's
- * image+stack (chosen over text-sharing so non-PIC binaries with
- * writable .data/.bss work safely), translates the user sp into the
- * new buffer, and plants a trap_frame on the child's kernel stack
- * that mirrors the parent's except for a0 (=0 in the child) and sp
- * (=child_user_sp). The first switch_to() into the child enters
- * user_thread_bootstrap, jumps to trap_return_user, sret's into U.
+ * Allocates a new thread and clones the parent's address space with
+ * uvm_clone_vma(): every VMA's metadata is inherited (including the
+ * image's initrd file backing) and only the pages the parent actually
+ * populated are copied into private child frames at the same user VAs.
+ * Untouched pages demand-fault in the child later, so fork cost scales
+ * with the touched working set, not the image size. A trap_frame
+ * mirroring the parent's (except a0 = 0) is planted on the child's
+ * kernel stack; the first switch_to() enters user_thread_bootstrap,
+ * jumps to trap_return_user, and sret's into U.
  *
  * sepc was already advanced past the ecall by trap.c BEFORE
  * do_syscall() ran, so the child resumes at the instruction after
@@ -356,60 +249,23 @@ static long sys_fork(struct trap_frame *tf)
     if (!ch->pgd)
         goto fail_thread;
 
-    /* 2) Duplicate the image frames and map them at the SAME user VA.
-     *    Separate physical frames + identical layout = isolation. */
-    unsigned long img_bytes = par->image_pages;
-    void *img = buddy_alloc(img_bytes);
-    if (!img)
-        goto fail_pgd;
-    mem_cpy(img, par->image_base, img_bytes);
-    asm volatile ("fence.i" ::: "memory");
-    if (map_pages(ch->pgd, USER_CODE_VA, img_bytes,
-                  virt_to_phys(img), PROT_USER_RWX) != 0)
-        goto fail_img;
+    /* 2) Clone VMA metadata + copy only the parent's populated pages. */
+    if (uvm_clone_vma(ch, par) != 0)
+        goto fail_vm;
 
-    /* 3) Duplicate the stack frames likewise. */
-    unsigned long stk_bytes = par->user_stack_size;
-    void *stk = buddy_alloc(stk_bytes);
-    if (!stk)
-        goto fail_img;
-    mem_cpy(stk, par->user_stack_base, stk_bytes);
-    if (map_pages(ch->pgd, USER_STACK_TOP - stk_bytes, stk_bytes,
-                  virt_to_phys(stk), PROT_USER_DATA) != 0)
-        goto fail_stk;
+    /* 2b) The parent's sigpage is eager, hence present, hence copied by
+     *     the clone above; re-derive the child's kernel-VA alias from its
+     *     own page table. */
+    unsigned long *spte = pt_lookup(ch->pgd, SIGPAGE_VA);
+    if (!spte || !(*spte & PTE_V))
+        goto fail_vm;
+    ch->sigpage_base = phys_to_virt(PTE_TO_PA(*spte));
 
-    /* 3b) Child's own signal page (PROT_USER_RWX). Contents need not be
-     *     copied: the handler stack/trampoline are (re)established at
-     *     dispatch time; we only need the backing frame mapped at the same
-     *     SIGPAGE_VA so a signal can be delivered to the child in U-mode. */
-    void *sig = buddy_alloc(PAGE_SIZE);
-    if (!sig)
-        goto fail_stk;
-    if (map_pages(ch->pgd, SIGPAGE_VA, PAGE_SIZE,
-                  virt_to_phys(sig), PROT_USER_RWX) != 0)
-        goto fail_sig;
-
-    ch->image_base      = img;
-    ch->image_size      = par->image_size;
-    ch->image_pages     = img_bytes;
-    ch->user_stack_base = stk;
-    ch->user_stack_size = stk_bytes;
-    ch->sigpage_base    = sig;
     /* Inherit the parent's placement cursor so the child's future mmaps
-     * land below the regions it inherited (copied below), not on top. */
-    ch->mmap_top        = par->mmap_top;
+     * land below the regions it inherited, not on top. */
+    ch->mmap_top = par->mmap_top;
 
-    /*
-     * 3c) Register the three fixed regions as the child's VMAs (is_mmap=0)
-     *     and then copy every mmap VMA from the parent. After this point
-     *     the child's frame blocks are owned by ch->vma_list, so failures
-     *     unwind via vma_unmap_all(ch) (fail_vmas) — NOT the per-block
-     *     buddy_free paths, which would double-free.
-     */
-    if (fork_copy_vmas(par, ch, img, img_bytes, stk, stk_bytes, sig) != 0)
-        goto fail_sig;
-
-    /* 4) Plant child's trap_frame at the top of its kstack. The child
+    /* 3) Plant child's trap_frame at the top of its kstack. The child
      *    keeps the parent's user sp VERBATIM: parent and child share an
      *    identical user VA layout, so that VA points into the child's own
      *    stack frames within its own address space — no translation. */
@@ -430,7 +286,7 @@ static long sys_fork(struct trap_frame *tf)
     /* 5) Inherit signal handler table from parent; pending/in_handler
      *    do NOT cross the fork boundary (POSIX: child starts with an
      *    empty pending set, not running any handler). The child's signal
-     *    page is its own (mapped above), independent of the parent's. */
+     *    page is its own (cloned above), independent of the parent's. */
     mem_cpy(&ch->sig.handlers, &par->sig.handlers,
             sizeof(par->sig.handlers));
     ch->sig.pending       = 0;
@@ -445,13 +301,10 @@ static long sys_fork(struct trap_frame *tf)
     thread_enqueue_ready(ch);
     return (long)ch->pid;           /* parent path */
 
-fail_sig:
-    buddy_free(sig);
-fail_stk:
-    buddy_free(stk);
-fail_img:
-    buddy_free(img);
-fail_pgd:
+fail_vm:
+    /* Single-owner rollback: nodes via the VMA list, frames + tables via
+     * pgd_free() — no per-block goto chain. */
+    vma_free_list(&ch->vma_list);
     pgd_free(ch->pgd);
     ch->pgd = NULL;
 fail_thread:
@@ -506,17 +359,19 @@ static long sys_waitpid(long pid)
 }
 
 /** ----------------------------------------------------------------------
- * @brief sys_exit() – Terminate the current process.
+ * @brief do_exit() – Terminate the current process (never returns).
  *
  * Reparents any surviving children onto g_bootstrap (so a future
- * waitpid by the shell can reap them; in fork_test scope this never
- * fires), frees the user image, marks self ZOMBIE, wakes the parent
- * if it was blocked in waitpid, and yields. The kernel stack is
+ * waitpid by the shell can reap them), marks self ZOMBIE, wakes the
+ * parent if it was blocked in waitpid, and yields. The kernel stack is
  * reaped later by sys_waitpid()'s sched_zombify() call (or by the
- * stop() path).
+ * stop() path). Exported (see syscall.h) because the page-fault
+ * handler's segfault kill needs the exact same teardown as a voluntary
+ * exit — satp still points at self->pgd in both cases, so VM reclaim
+ * must equally wait for the reaper.
  * @param status Exit status returned to the parent's waitpid.
  * -------------------------------------------------------------------- */
-static void sys_exit(long status)
+void do_exit(long status)
 {
     struct thread *self = get_current();
 
@@ -537,10 +392,10 @@ static void sys_exit(long status)
 
     /*
      * Do NOT free the user address space here: satp still points at
-     * self->pgd. The reaper (kill_zombies) frees the image/stack frames,
-     * the signal page and the page tables after schedule() has switched
-     * satp away. signal_release() only clears the in_handler gate so a
-     * thread dying mid-handler leaves a clean signal state.
+     * self->pgd. The reaper (kill_zombies) frees the user frames, the
+     * page tables and the PGD after schedule() has switched satp away.
+     * signal_release() only clears the in_handler gate so a thread
+     * dying mid-handler leaves a clean signal state.
      */
     signal_release(self);
 
@@ -550,6 +405,15 @@ static void sys_exit(long status)
     schedule();
     for (;;)
         ;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_exit() – SYS_EXIT entry point; thin do_exit() wrapper.
+ * @param status Exit status returned to the parent's waitpid.
+ * -------------------------------------------------------------------- */
+static void sys_exit(long status)
+{
+    do_exit(status);
 }
 
 /** ----------------------------------------------------------------------

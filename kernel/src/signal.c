@@ -184,7 +184,7 @@ static void plant_sigreturn_trampoline(void *stack_base)
 void signal_check_and_dispatch(struct trap_frame *tf)
 {
     struct thread *self = get_current();
-    if (!self || !self->image_base)
+    if (!self || !self->pgd)
         return;
     if (self->sig.in_handler || self->sig.pending == 0)
         return;
@@ -210,8 +210,9 @@ void signal_check_and_dispatch(struct trap_frame *tf)
     }
 
     /* A user process must own a signal page to receive a handler. (Kernel
-     * threads were already filtered out by image_base above; this also
-     * guards a never-set-up image.) */
+     * threads were already filtered out by the pgd check above; this also
+     * guards a never-set-up image. The sigpage is eagerly populated at
+     * setup, so it is always present here for a real user process.) */
     if (!self->sigpage_base)
         return;
 
