@@ -217,13 +217,16 @@ static long sys_exec(const char *path, struct trap_frame *tf)
  *
  * Allocates a new thread and clones the parent's address space with
  * uvm_clone_vma(): every VMA's metadata is inherited (including the
- * image's initrd file backing) and only the pages the parent actually
- * populated are copied into private child frames at the same user VAs.
- * Untouched pages demand-fault in the child later, so fork cost scales
- * with the touched working set, not the image size. A trap_frame
- * mirroring the parent's (except a0 = 0) is planted on the child's
- * kernel stack; the first switch_to() enters user_thread_bootstrap,
- * jumps to trap_return_user, and sret's into U.
+ * image's initrd file backing) and the pages the parent actually
+ * populated are shared copy-on-write — both sides' PTEs reference the
+ * same frame, downgraded to read-only, and the first store from either
+ * side breaks the share into a private copy. Only the sigpage is
+ * eagerly copied (the kernel writes it through a linear-map alias that
+ * bypasses PTE protection). Untouched pages demand-fault in the child
+ * later, so fork cost scales with page-table size, not the image. A
+ * trap_frame mirroring the parent's (except a0 = 0) is planted on the
+ * child's kernel stack; the first switch_to() enters
+ * user_thread_bootstrap, jumps to trap_return_user, and sret's into U.
  *
  * sepc was already advanced past the ecall by trap.c BEFORE
  * do_syscall() ran, so the child resumes at the instruction after

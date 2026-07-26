@@ -19,6 +19,15 @@
 #define PTE_A   (1UL << 6)   /* Accessed                                  */
 #define PTE_D   (1UL << 7)   /* Dirty                                     */
 
+/*
+ * Software-defined PTE bit (Sv39 RSW field, bits 8-9: ignored by the MMU).
+ * PTE_COW marks a leaf whose frame is copy-on-write shared between address
+ * spaces: PTE_W has been withheld even though the owning VMA allows writes,
+ * so a store raises a page fault that the kernel resolves by breaking the
+ * share (copy or in-place upgrade) instead of killing the process.
+ */
+#define PTE_COW (1UL << 8)   /* RSW: frame is CoW-shared, W withheld      */
+
 /* Common leaf permission sets for the kernel linear map. */
 #define PROT_KERNEL  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D)
 #define PROT_DEVICE  (PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D)
@@ -93,6 +102,9 @@
 
 /* Extract the next-level table PA from a non-leaf PTE. */
 #define PTE_TO_PA(pte)   ((((unsigned long)(pte) >> 10) << 12))
+
+/* Flag bits of a PTE: V..D plus the RSW software bits (bits 0-9). */
+#define PTE_FLAGS_MASK   ((1UL << 10) - 1)
 
 /*
  * Per-level page-table index extraction for an Sv39 walk.

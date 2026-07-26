@@ -332,12 +332,15 @@ unsigned long *pt_lookup(unsigned long *pgd, unsigned long va)
  *
  * Walks the low half (PGD indices 0..KERNEL_PGD_HALF-1): for each valid
  * PGD entry frees every mapped user frame (valid leaf PTE), then the PTE
- * table, then the PMD table. Under demand paging the page table is the
- * single owner of user frames — VMAs are metadata only — so this is the
- * one teardown path shared by exit-reap, exec replacement and fork
- * rollback. Every user leaf is an individually buddy_alloc'd 4 KiB page
- * (no 2 MiB user leaves exist), so per-leaf buddy_free is safe. The
- * shared kernel high half (>= KERNEL_PGD_HALF) is never touched.
+ * table, then the PMD table. User frames are co-owned through the buddy
+ * allocator's per-frame refcount — VMAs are metadata only — so this is
+ * the one teardown path shared by exit-reap, exec replacement and fork
+ * rollback: buddy_free() on a copy-on-write-shared frame merely drops
+ * this address space's reference, and only the last owner's call
+ * actually releases the frame. Every user leaf is an individually
+ * buddy_alloc'd 4 KiB page (no 2 MiB user leaves exist), so per-leaf
+ * buddy_free is safe. The shared kernel high half (>= KERNEL_PGD_HALF)
+ * is never touched.
  * @param pgd Root page table whose user half is to be freed.
  * -------------------------------------------------------------------- */
 void uvm_destroy(unsigned long *pgd)
@@ -737,29 +740,102 @@ static int demand_page(struct thread *t, struct vma *v, unsigned long addr)
 }
 
 /** ----------------------------------------------------------------------
- * @brief do_page_fault() – Demand-populate or kill on scause 12/13/15.
+ * @brief do_cow_fault() – Break a copy-on-write share for one page.
+ *
+ * Called for a store fault on a present PTE carrying PTE_COW, i.e. a
+ * frame shared by fork whose VMA does permit writes. Two outcomes:
+ *   - Sole owner (refcount == 1: the peer exited or already broke its
+ *     copy): upgrade the PTE in place — restore W, set D, clear COW.
+ *     No copy, no allocation.
+ *   - Still shared: allocate a private frame, copy the page, install a
+ *     fresh PTE with the VMA's full prot (which never contains
+ *     PTE_COW), then drop one reference on the old frame via
+ *     buddy_free(). The free comes AFTER the new PTE is installed so
+ *     an OOM bail-out never loses a reference.
+ * Either way the stale read-only translation for @addr is flushed and
+ * 0 is returned with sepc untouched, so sret retries the store — this
+ * also covers S-mode stores to user buffers under SUM, which resume
+ * mid-syscall the same way.
+ *
+ * SIE is re-enabled first, matching do_page_fault()'s convention (the
+ * IRQ-driven uart TX ring and the buddy calls both want interrupts).
+ * The refcount snapshot is race-free on a single hart: a count of 1
+ * cannot concurrently grow, because only the sole owner itself could
+ * fork the frame to a new sharer.
+ * @param t    Faulting thread (valid t->pgd).
+ * @param v    VMA covering @addr (write permission already checked).
+ * @param pte  Leaf PTE slot for @addr (present, PTE_COW set).
+ * @param addr Faulting user VA (any offset within the page).
+ * @return 0 (retry via sret); on OOM the process is killed instead.
+ * -------------------------------------------------------------------- */
+static int do_cow_fault(struct thread *t, struct vma *v,
+                        unsigned long *pte, unsigned long addr)
+{
+    asm volatile ("csrs sstatus, %0" :: "r"((unsigned long)SSTATUS_SIE));
+
+    void *old_frame = phys_to_virt(PTE_TO_PA(*pte));
+
+    if (buddy_ref_read(old_frame) == 1) {
+        /* Sole owner: upgrade in place, no copy needed. */
+        *pte = (*pte | PTE_W | PTE_D) & ~PTE_COW;
+    } else {
+        void *np = buddy_alloc(PAGE_SIZE);
+        if (!np) {
+            /* OOM while breaking the share: no page to retry on. */
+            uart_puts("[Segmentation fault]: Kill Process\n");
+            do_exit(-1);        /* never returns */
+        }
+        mem_cpy(np, old_frame, PAGE_SIZE);
+        *pte = MAKE_PTE(virt_to_phys(np), v->prot);
+        buddy_free(old_frame);  /* drop this side's reference */
+        if (v->prot & PTE_X)
+            asm volatile ("fence.i" ::: "memory");
+    }
+
+    /* Only this VA's read-only translation can be stale; flush it. */
+    asm volatile ("sfence.vma %0, zero" :: "r"(addr & ~(PAGE_SIZE - 1))
+                  : "memory");
+
+    uart_puts("[Permission fault]: 0x");
+    print_hex_ulong(addr);
+    uart_puts("\n");
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief do_page_fault() – Demand-populate, CoW-break or kill (scause
+ *        12/13/15).
  *
  * Decision order:
  *   1. Kernel-only thread (no pgd) → -1: the caller's diagnostic halt
  *      path handles what can only be a kernel bug.
- *   2. Fault outside every VMA, or access type not permitted by the
- *      covering VMA's prot, or leaf already present (present + faulting
- *      == permission violation; also breaks any infinite fault loop):
- *      → segmentation fault. From U-mode the process is killed via
- *      do_exit(-1) (never returns). From S-mode this means the kernel
- *      dereferenced a pointer in_user_range() should have rejected —
- *      a kernel bug — so return -1 to the halt path instead of killing.
- *   3. Otherwise a legal not-yet-populated page: populate one page and
+ *   2. Store fault on a present PTE carrying PTE_COW, within a VMA that
+ *      permits the access → break the share via do_cow_fault(). This
+ *      is checked BEFORE the S-mode (SPP) kernel-bug path: a syscall
+ *      writing a user buffer under SUM legitimately store-faults on a
+ *      CoW page from S-mode and must resume, not halt.
+ *   3. Fault outside every VMA, or access type not permitted by the
+ *      covering VMA's prot, or leaf already present without PTE_COW
+ *      (present + faulting == permission violation; also breaks any
+ *      infinite fault loop): → segmentation fault. From U-mode the
+ *      process is killed via do_exit(-1) (never returns). From S-mode
+ *      this means the kernel dereferenced a pointer in_user_range()
+ *      should have rejected — a kernel bug — so return -1 to the halt
+ *      path instead of killing.
+ *   4. Otherwise a legal not-yet-populated page: populate one page and
  *      return 0. sepc is deliberately left untouched so sret retries
  *      the faulting instruction — S-mode faults (syscall dereferencing
  *      an untouched user buffer under SUM) resume mid-syscall the same
  *      way.
  *
+ * Loads and fetches never reach the CoW branch: the fork-time downgrade
+ * only withholds W, so R/X access to a CoW page does not fault.
+ *
  * SIE is re-enabled before any uart print (the IRQ-driven TX ring needs
  * interrupts; hardware cleared SIE on trap entry) and before the buddy
  * calls, matching the syscall path's convention.
  * @param tf Trap frame of the faulting context.
- * @return 0 populated (retry via sret), -1 kernel bug (caller halts).
+ * @return 0 handled (retry via sret), -1 kernel bug (caller halts).
  * -------------------------------------------------------------------- */
 int do_page_fault(struct trap_frame *tf)
 {
@@ -781,8 +857,11 @@ int do_page_fault(struct trap_frame *tf)
     int violation = (!v || !(v->prot & need));
     if (!violation) {
         unsigned long *pte = pt_lookup(cur->pgd, addr);
-        if (pte && (*pte & PTE_V))
+        if (pte && (*pte & PTE_V)) {
+            if (tf->scause == EXC_STORE_PAGE_FAULT && (*pte & PTE_COW))
+                return do_cow_fault(cur, v, pte, addr);
             violation = 1;
+        }
     }
 
     if (violation) {
@@ -808,20 +887,39 @@ int do_page_fault(struct trap_frame *tf)
 }
 
 /** ----------------------------------------------------------------------
- * @brief uvm_clone_vma() – Fork-time per-page clone of @par into @ch.
+ * @brief uvm_clone_vma() – Fork-time copy-on-write clone of @par into @ch.
  *
  * For every parent VMA, clones the metadata node (range, prot, file
  * backing, is_mmap) onto ch->vma_list, then walks the region page by
- * page and copies ONLY the leaves the parent actually populated into
- * fresh frames mapped at the same user VA in ch->pgd. Untouched pages
- * are not copied: the child demand-faults them later from its own
- * (inherited) VMA, including the file backing. One fence.i after the
- * loop covers every executable page copied.
+ * page and SHARES every leaf the parent actually populated: the child's
+ * PTE maps the same physical frame, and both sides of a writable VMA
+ * are downgraded to read-only with PTE_COW set, so the first store from
+ * either side faults into do_cow_fault(). Each shared frame gains one
+ * reference via buddy_ref_inc(); teardown paths drop it through the
+ * dec-and-test in buddy_free(). Read-only VMAs are shared as-is (no
+ * PTE_COW): they can never legally be written, so the share never needs
+ * breaking. Untouched pages are not shared: the child demand-faults
+ * them later into a private frame from its own (inherited) VMA.
+ *
+ * The sigpage is the one exception, eagerly copied instead of shared:
+ * the kernel writes trampoline state through t->sigpage_base, a
+ * linear-map alias that bypasses the user PTE's read-only protection
+ * entirely — a CoW-shared sigpage would let one process's signal
+ * delivery corrupt the other's, and a U-mode CoW break would leave
+ * sigpage_base pointing at the stale old frame.
+ *
+ * The parent's PTEs are rewritten in place, so one full sfence.vma
+ * after the loop flushes any stale writable translations it may still
+ * have cached; fence.i covers the executable bytes in the copied
+ * sigpage. Downgrading an already-CoW page again (fork of a fork) is
+ * idempotent — the frame just gains another sharer.
  *
  * On failure the partially built metadata/frames remain on @ch; the
  * caller unwinds with vma_free_list(&ch->vma_list) (nodes) +
- * pgd_free(ch->pgd) (frames + tables) — the same single-owner teardown
- * as every other path.
+ * pgd_free(ch->pgd), whose buddy_free() calls drop the child's
+ * references on shared frames. A parent PTE left downgraded by a
+ * failed fork self-heals on its next write: do_cow_fault() finds
+ * refcount == 1 and upgrades it back in place.
  * @param ch  Child thread (empty vma_list, valid ch->pgd).
  * @param par Parent thread being forked.
  * @return 0 on success, -1 on OOM.
@@ -839,25 +937,50 @@ int uvm_clone_vma(struct thread *ch, struct thread *par)
             return -1;
         vma_insert_sorted(ch, nv);
 
-        for (unsigned long off = 0; off < pv->len; off += PAGE_SIZE) {
-            unsigned long *pte = pt_lookup(par->pgd, pv->va + off);
+        if (pv->va == SIGPAGE_VA) {
+            /* Eager private copy — see the sigpage note above. */
+            unsigned long *pte = pt_lookup(par->pgd, pv->va);
             if (!pte || !(*pte & PTE_V))
-                continue;       /* never touched: child faults later */
+                return -1;
 
             void *np = buddy_alloc(PAGE_SIZE);
             if (!np)
                 return -1;
             mem_cpy(np, phys_to_virt(PTE_TO_PA(*pte)), PAGE_SIZE);
 
-            if (map_pages(ch->pgd, pv->va + off, PAGE_SIZE,
+            if (map_pages(ch->pgd, pv->va, PAGE_SIZE,
                           virt_to_phys(np), pv->prot) != 0) {
                 buddy_free(np);
                 return -1;
             }
+            continue;
+        }
+
+        for (unsigned long off = 0; off < pv->len; off += PAGE_SIZE) {
+            unsigned long *ppte = pt_lookup(par->pgd, pv->va + off);
+            if (!ppte || !(*ppte & PTE_V))
+                continue;       /* never touched: child faults later */
+
+            unsigned long shared = *ppte;
+            if (pv->prot & PTE_W) {
+                /* Withhold W on BOTH sides so either side's first
+                 * store faults into the CoW break. */
+                shared = (shared & ~PTE_W) | PTE_COW;
+                *ppte  = shared;
+            }
+
+            if (map_pages(ch->pgd, pv->va + off, PAGE_SIZE,
+                          PTE_TO_PA(shared),
+                          shared & PTE_FLAGS_MASK) != 0)
+                return -1;
+            buddy_ref_inc(phys_to_virt(PTE_TO_PA(shared)));
         }
     }
 
-    /* Some copied pages are executable; sync the I-cache once. */
+    /* The parent may still hold writable translations for the pages
+     * downgraded above; flush them all at once (fork is infrequent). */
+    asm volatile ("sfence.vma zero, zero" ::: "memory");
+    /* The copied sigpage contains executable bytes; sync the I-cache. */
     asm volatile ("fence.i" ::: "memory");
     return 0;
 }

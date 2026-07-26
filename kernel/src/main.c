@@ -116,14 +116,17 @@ int main(unsigned long hart_id, void *dtb_ptr)
     /* Step 6: Allocate metadata arrays via the startup allocator. */
     unsigned long total_pages    = mem_size / PAGE_SIZE;
     unsigned long fa_bytes       = total_pages * sizeof(int);
+    unsigned long ra_bytes       = total_pages * sizeof(unsigned int);
     unsigned long ppi_bytes      = total_pages * sizeof(signed char);
 
-    int         *frame_array    = (int *)buddy_startup_alloc(fa_bytes);
-    signed char *page_pool_idx  = (signed char *)buddy_startup_alloc(ppi_bytes);
+    int          *frame_array   = (int *)buddy_startup_alloc(fa_bytes);
+    unsigned int *ref_array     = (unsigned int *)buddy_startup_alloc(ra_bytes);
+    signed char  *page_pool_idx = (signed char *)buddy_startup_alloc(ppi_bytes);
 
     /* Step 7: Initialize the buddy allocator with the dynamically
-     * allocated frame array.  Free lists are NOT built yet. */
-    buddy_init(mem_base, mem_size, frame_array, total_pages);
+     * allocated frame array and per-frame reference-count array.
+     * Free lists are NOT built yet. */
+    buddy_init(mem_base, mem_size, frame_array, ref_array, total_pages);
 
     /* Step 8: Replay all regions that were registered with the startup
      * allocator (reserved regions + metadata allocations) into the buddy

@@ -4,6 +4,7 @@
 #include "utils.h"
 #include "types.h"
 #include "mm.h"
+#include "riscv.h"   /* sie_save_clear/sie_restore for refcount RMW */
 
 /*
  * Compile-time switch for the noisy per-page trace lines prefixed with
@@ -14,10 +15,10 @@
 
 /* ===== Frame Array ======================================================
  *
- *   frame_array[i] >= 0             : head of a free block of order val
- *   frame_array[i] == FRAME_FREE_PART (-1) : free, part of a larger block
- *   frame_array[i] == FRAME_RESERVED  (-2) : reserved, never allocatable
- *   frame_array[i] == ALLOC_TAG(idx, order): allocated
+ *   g_frame_array[i] >= 0             : head of a free block of order val
+ *   g_frame_array[i] == FRAME_FREE_PART (-1) : free, part of a larger block
+ *   g_frame_array[i] == FRAME_RESERVED  (-2) : reserved, never allocatable
+ *   g_frame_array[i] == ALLOC_TAG(idx, order): allocated
  *
  * For free block heads we embed a struct list_head at the start of the
  * page's memory (the page is unused, so this is safe).
@@ -33,7 +34,18 @@ static uintptr_t      g_buddy_base;
 static uintptr_t      g_buddy_end;
 static unsigned long  g_total_pages;
 
-static int *frame_array;             /* dynamically allocated by startup allocator */
+static int *g_frame_array;           /* dynamically allocated by startup allocator */
+
+/*
+ * Per-frame reference counts, parallel to g_frame_array and indexed by the
+ * HEAD frame of an allocated block. buddy_alloc() sets the head's count
+ * to 1; buddy_ref_inc() adds a sharer (copy-on-write); buddy_free() is
+ * dec-and-test — the block only returns to the free lists when the last
+ * reference is dropped. Non-shared allocations (page tables, kstacks,
+ * kmalloc pools) stay at 1 for their whole lifetime, so their free path
+ * behaves exactly as before.
+ */
+static unsigned int *g_ref_array;      /* dynamically allocated by startup allocator */
 
 /* One free-list head per order (0 .. MAX_ORDER). */
 static struct list_head free_list[MAX_ORDER + 1];
@@ -169,11 +181,11 @@ static void log_buddy_found(unsigned long buddy_idx, unsigned long page_idx,
 /** Put free block starting at @idx of given @order onto its free list. */
 static void block_push(unsigned long idx, int order)
 {
-    frame_array[idx] = order;
+    g_frame_array[idx] = order;
     /* Mark remaining pages in this block as FRAME_FREE_PART */
     unsigned long count = 1UL << order;
     for (unsigned long i = 1; i < count; i++)
-        frame_array[idx + i] = FRAME_FREE_PART;
+        g_frame_array[idx + i] = FRAME_FREE_PART;
 
     struct list_head *node = frame_list_head(idx);
     INIT_LIST_HEAD(node);
@@ -193,13 +205,32 @@ static void block_pop(unsigned long idx, int order)
 
 /* ===== Public API ======================================================= */
 
+/**
+ * ---------------------------------------------------------------------------
+ * @brief Initialize the buddy allocator over a physical memory region.
+ *
+ * Records the managed region bounds and page count, binds the caller-provided
+ * frame-state and reference-count arrays, and resets all per-frame state. Every
+ * frame is marked FRAME_FREE_PART with a zero reference count; the free lists
+ * themselves are left empty here and populated later, once all buddy_reserve()
+ * calls have carved out the unavailable ranges.
+ *
+ * @param base            Physical base address of the managed region.
+ * @param size            Size of the managed region in bytes.
+ * @param ext_frame_array Caller-provided per-frame state array.
+ * @param ext_ref_array   Caller-provided per-frame reference-count array.
+ * @param frame_count     Number of frames covered by the arrays.
+ * ---------------------------------------------------------------------------
+ */
 void buddy_init(uintptr_t base, uintptr_t size,
-                int *ext_frame_array, unsigned long frame_count)
+                int *ext_frame_array, unsigned int *ext_ref_array,
+                unsigned long frame_count)
 {
     g_buddy_base  = base;
     g_buddy_end   = base + size;
     g_total_pages = frame_count;
-    frame_array   = ext_frame_array;
+    g_frame_array = ext_frame_array;
+    g_ref_array   = ext_ref_array;
 
     /* Initialize all free list heads. */
     for (int i = 0; i <= MAX_ORDER; i++)
@@ -207,15 +238,17 @@ void buddy_init(uintptr_t base, uintptr_t size,
 
     /* Mark every frame as free-part; free lists will be built later,
      * after all buddy_reserve() calls are done. */
-    for (unsigned long i = 0; i < g_total_pages; i++)
-        frame_array[i] = FRAME_FREE_PART;
+    for (unsigned long i = 0; i < g_total_pages; i++) {
+        g_frame_array[i] = FRAME_FREE_PART;
+        g_ref_array[i]   = 0;
+    }
 
     uart_puts("[Buddy] Init: base=0x");
     print_hex_ulong(base);
     uart_puts(" pages=");
     print_dec_ulong(g_total_pages);
     uart_puts("\n");
-}
+}    /* buddy_init */
 
 void buddy_reserve(uintptr_t start, uintptr_t end)
 {
@@ -235,7 +268,7 @@ void buddy_reserve(uintptr_t start, uintptr_t end)
     unsigned long last  = addr_to_idx(end);   /* exclusive */
 
     for (unsigned long i = first; i < last; i++)
-        frame_array[i] = FRAME_RESERVED;
+        g_frame_array[i] = FRAME_RESERVED;
 
     uart_puts("[Reserve] 0x");
     print_hex_ulong(start);
@@ -259,7 +292,7 @@ void buddy_build_free_lists(void)
     unsigned long idx = 0;
     while (idx < g_total_pages) {
         /* Skip reserved pages one by one. */
-        if (frame_array[idx] == FRAME_RESERVED) {
+        if (g_frame_array[idx] == FRAME_RESERVED) {
             idx++;
             continue;
         }
@@ -284,7 +317,7 @@ void buddy_build_free_lists(void)
             /* Ensure no reserved page inside this block. */
             int clean = 1;
             for (unsigned long k = 0; k < block; k++) {
-                if (frame_array[idx + k] == FRAME_RESERVED) {
+                if (g_frame_array[idx + k] == FRAME_RESERVED) {
                     clean = 0;
                     break;
                 }
@@ -340,7 +373,10 @@ void *buddy_alloc(unsigned long size)
     /* Mark all pages of the allocated block. */
     unsigned long alloc_pages = 1UL << target_order;
     for (unsigned long i = 0; i < alloc_pages; i++)
-        frame_array[idx + i] = ALLOC_TAG(idx, target_order);
+        g_frame_array[idx + i] = ALLOC_TAG(idx, target_order);
+
+    /* The caller is the sole owner until buddy_ref_inc() adds sharers. */
+    g_ref_array[idx] = 1;
 
     /* Return a dereferenceable VA; internal bookkeeping stays in PA. */
     return frame_pa_to_ptr(idx_to_addr(idx));
@@ -360,15 +396,37 @@ void buddy_free(void *ptr)
     unsigned long idx = addr_to_idx(addr);
 
     /* Guard against freeing a reserved page. */
-    if (frame_array[idx] == FRAME_RESERVED)
+    if (g_frame_array[idx] == FRAME_RESERVED)
         return;
 
+    /*
+     * Dec-and-test on the per-frame reference count. The RMW is bracketed
+     * against S-mode interrupts: fault handlers run with SIE on, so two
+     * sharers' inc/dec could otherwise interleave through preemption.
+     * While other sharers remain the block must stay allocated — only the
+     * last reference actually releases it into the free lists below.
+     */
+    unsigned long flags = sie_save_clear();
+    if (g_ref_array[idx] == 0) {
+        sie_restore(flags);
+        uart_puts("[Buddy] WARN: free of zero-ref block idx=");
+        print_dec_ulong(idx);
+        uart_puts("\n");
+        return;
+    }
+    g_ref_array[idx]--;
+    if (g_ref_array[idx] > 0) {
+        sie_restore(flags);
+        return;
+    }
+    sie_restore(flags);
+
     /* Extract the order of the originally allocated block from the tag */
-    int order = GET_ALLOC_ORDER(frame_array[idx]);
+    int order = GET_ALLOC_ORDER(g_frame_array[idx]);
 
     /* Mark pages as free. */
     for (unsigned long j = 0; j < (1UL << order); j++)
-        frame_array[idx + j] = FRAME_FREE_PART;
+        g_frame_array[idx + j] = FRAME_FREE_PART;
 
     /* Coalesce with buddy iteratively. */
     unsigned long cur_idx = idx;
@@ -382,11 +440,11 @@ void buddy_free(void *ptr)
             break;
 
         /* Buddy must not be reserved. */
-        if (frame_array[buddy_idx] == FRAME_RESERVED)
+        if (g_frame_array[buddy_idx] == FRAME_RESERVED)
             break;
 
         /* Buddy must be a free block head of the same order. */
-        if (frame_array[buddy_idx] != cur_order)
+        if (g_frame_array[buddy_idx] != cur_order)
             break;
 
         log_buddy_found(buddy_idx, cur_idx, cur_order);
@@ -405,10 +463,57 @@ void buddy_free(void *ptr)
     block_push(cur_idx, cur_order);
 }
 
+/** ----------------------------------------------------------------------
+ * @brief buddy_ref_inc() – Take one extra reference on a block.
+ *
+ * Registers a new co-owner of the block whose head is at @ptr (the VA
+ * previously returned by buddy_alloc()); a matching buddy_free() from
+ * that owner later drops the reference. The increment is bracketed
+ * against S-mode interrupts for the same reason as the dec-and-test in
+ * buddy_free(): sharers may race through preemption.
+ * @param ptr Linear-map VA of the block head.
+ * -------------------------------------------------------------------- */
+void buddy_ref_inc(void *ptr)
+{
+    if (!ptr)
+        return;
+
+    uintptr_t addr = frame_ptr_to_pa(ptr);
+    if (addr < g_buddy_base || addr >= g_buddy_end)
+        return;
+
+    unsigned long idx = addr_to_idx(addr);
+
+    unsigned long flags = sie_save_clear();
+    g_ref_array[idx]++;
+    sie_restore(flags);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief buddy_ref_read() – Read the reference count of a block.
+ *
+ * Single-word read, no locking: on a single hart a snapshot is enough
+ * for the copy-on-write "sole owner?" decision — a count of 1 cannot
+ * concurrently grow, because only the sole owner itself could fork.
+ * @param ptr Linear-map VA of the block head.
+ * @return Current reference count, or 0 if @ptr is out of range.
+ * -------------------------------------------------------------------- */
+unsigned int buddy_ref_read(void *ptr)
+{
+    if (!ptr)
+        return 0;
+
+    uintptr_t addr = frame_ptr_to_pa(ptr);
+    if (addr < g_buddy_base || addr >= g_buddy_end)
+        return 0;
+
+    return g_ref_array[addr_to_idx(addr)];
+}
+
 /* ===== Startup Allocator ==================================================
  *
  * Bump-style allocator used exclusively before buddy_init() is called.
- * Its sole purpose is to allocate metadata arrays (frame_array,
+ * Its sole purpose is to allocate metadata arrays (g_frame_array,
  * page_pool_idx) from the first usable gap in the physical memory region,
  * skipping all reserved ranges registered via buddy_startup_reserve().
  *
@@ -557,7 +662,7 @@ void *buddy_startup_alloc(unsigned long size)
     uart_puts("\n");
 
     /* ret is a PA; hand the caller a dereferenceable linear-map VA so the
-     * metadata arrays (frame_array, page_pool_idx) can be indexed directly. */
+     * metadata arrays (g_frame_array, page_pool_idx) can be indexed directly. */
     return frame_pa_to_ptr(ret);
 }
 

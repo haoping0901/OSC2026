@@ -71,10 +71,14 @@ void buddy_startup_replay_reserves(void);
  * @size:        byte length of the region
  * @frame_array: pointer to an int array of @frame_count elements,
  *               allocated by buddy_startup_alloc()
+ * @ref_array:   pointer to an unsigned int array of @frame_count elements
+ *               (per-frame reference counts), allocated by
+ *               buddy_startup_alloc(); zeroed here
  * @frame_count: number of page frames in the region (size / PAGE_SIZE)
  */
 void buddy_init(uintptr_t base, uintptr_t size,
-                int *frame_array, unsigned long frame_count);
+                int *frame_array, unsigned int *ref_array,
+                unsigned long frame_count);
 
 /**
  * buddy_reserve - mark all 4 KiB pages overlapping [start, end) as RESERVED.
@@ -104,8 +108,24 @@ unsigned long buddy_get_total_pages(void);
 void *buddy_alloc(unsigned long size);
 
 /**
- * buddy_free - free memory previously returned by buddy_alloc().
+ * buddy_free - drop one reference on a block returned by buddy_alloc().
+ * The block is actually released (and merged with its buddy) only when
+ * the reference count reaches zero; while sharers remain, the call just
+ * decrements the count and returns.
  */
 void buddy_free(void *ptr);
+
+/**
+ * buddy_ref_inc - take one extra reference on the block that starts at @ptr.
+ * Used when a second address space starts sharing the frame (copy-on-write);
+ * each sharer later drops its reference through buddy_free().
+ */
+void buddy_ref_inc(void *ptr);
+
+/**
+ * buddy_ref_read - read the current reference count of the block at @ptr.
+ * Returns 0 if @ptr is outside the managed region.
+ */
+unsigned int buddy_ref_read(void *ptr);
 
 #endif /* __BUDDY_H__ */
