@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "video.h"
 #include "mm.h"
+#include "vfs.h"
 
 /* Kernel image boundaries exported by the linker script. */
 extern char _kernel_start[];
@@ -203,7 +204,13 @@ int main(unsigned long hart_id, void *dtb_ptr)
     sched_init();
     uart_puts("[Sched] bootstrap + idle thread ready.\n");
 
-    /* Step 15: Continue with the interactive shell. */
+    /* Step 15: Bring up the VFS and mount tmpfs as the root file
+     * system. Depends on kmalloc (Step 10) for the mount and root
+     * vnode, and must precede the shell so file commands find a root. */
+    vfs_init();
+    uart_puts("[VFS] tmpfs mounted as rootfs.\n");
+
+    /* Step 16: Continue with the interactive shell. */
     shell();
 
     return 0;

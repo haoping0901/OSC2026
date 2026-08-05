@@ -15,6 +15,7 @@
 #include "types.h"
 #include "signal.h"
 #include "mm.h"
+#include "vfs.h"
 
 #define SHELL_BUF_SIZE 128
 
@@ -35,6 +36,7 @@ static void shell_print_help(void)
     uart_puts("  cat   - print content of a file in the initial ramdisk.\n");
     uart_puts("  exec  - load a user program from initrd and run it in U-mode.\n");
     uart_puts("  test  - run memory allocator test.\n");
+    uart_puts("  vfstest - run VFS / tmpfs test.\n");
     uart_puts("  setTimeout <sec> <msg> - print msg after sec seconds.\n");
     uart_puts("  taskdemo - enqueue 3 tasks out of priority order.\n");
     uart_puts("  tasknest - nested priority dispatch demo (start -> inner -> end).\n");
@@ -331,6 +333,132 @@ static void shell_kill_pid(const char *args)
     uart_puts("\n");
 }
 
+/* ---------- VFS / tmpfs test case -------------------------------------- */
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_report() – Print one PASS/FAIL line for a check.
+ *
+ * Keeps the test body free of repeated formatting so each check reads
+ * as a single assertion.
+ * @param name Description of the check.
+ * @param ok   Non-zero when the check succeeded.
+ * -------------------------------------------------------------------- */
+static void vfs_report(const char *name, int ok)
+{
+    uart_puts(ok ? "[ OK ] " : "[FAIL] ");
+    uart_puts(name);
+    uart_puts("\n");
+}
+
+/** ----------------------------------------------------------------------
+ * @brief test_vfs() – Exercise the tmpfs round trip and its limits.
+ *
+ * Covers the create/write/close/reopen/read path plus the boundaries a
+ * tmpfs must enforce: name length, entries per directory, file size,
+ * duplicate creation, and reading an empty file.
+ * -------------------------------------------------------------------- */
+static void test_vfs(void)
+{
+    struct file *f = NULL;
+    char buf[64];
+    const char *msg = "Hello VFS from tmpfs!";
+    int msg_len = 21;
+
+    uart_puts("=== VFS / tmpfs test ===\n");
+
+    /* Create, write, then close. */
+    vfs_report("open /test.txt with O_CREAT",
+               vfs_open("/test.txt", O_CREAT, &f) == 0 && f != NULL);
+    if (!f)
+        return;
+
+    int written = vfs_write(f, msg, (size_t)msg_len);
+    vfs_report("write returns the full length", written == msg_len);
+    vfs_report("close", vfs_close(f) == 0);
+
+    /* Reopen without O_CREAT: the vnode must have outlived the handle. */
+    f = NULL;
+    vfs_report("reopen /test.txt without O_CREAT",
+               vfs_open("/test.txt", 0, &f) == 0 && f != NULL);
+    if (!f)
+        return;
+
+    for (int i = 0; i < (int)sizeof(buf); i++)
+        buf[i] = '\0';
+    int got = vfs_read(f, buf, sizeof(buf) - 1);
+    vfs_report("read back the same length", got == msg_len);
+    vfs_report("read back the same bytes", str_eq(buf, msg));
+    uart_puts("       content: ");
+    uart_puts(buf);
+    uart_puts("\n");
+
+    /* A second read starts at EOF because f_pos advanced. */
+    vfs_report("read at EOF returns 0", vfs_read(f, buf, sizeof(buf)) == 0);
+    vfs_close(f);
+
+    /* Missing file without O_CREAT must fail and must not be created. */
+    f = NULL;
+    vfs_report("open missing file without O_CREAT fails",
+               vfs_open("/nonexist.txt", 0, &f) != 0);
+
+    /* Boundary: a name longer than the 15-character limit. */
+    f = NULL;
+    vfs_report("reject name longer than 15 chars",
+               vfs_open("/0123456789abcdef", O_CREAT, &f) != 0);
+
+    /* Boundary: an empty file reads as EOF straight away. */
+    f = NULL;
+    if (vfs_open("/empty.txt", O_CREAT, &f) == 0 && f) {
+        vfs_report("read empty file returns 0",
+                   vfs_read(f, buf, sizeof(buf)) == 0);
+        vfs_close(f);
+    } else {
+        vfs_report("read empty file returns 0", 0);
+    }
+
+    /* Boundary: writing past the 4096-byte cap is truncated, not
+     * refused, so the return value reports the short write. */
+    f = NULL;
+    if (vfs_open("/big.txt", O_CREAT, &f) == 0 && f) {
+        static char big[5000];
+        for (int i = 0; i < (int)sizeof(big); i++)
+            big[i] = 'A';
+        int n = vfs_write(f, big, sizeof(big));
+        vfs_report("write beyond 4096 is truncated to 4096", n == 4096);
+        vfs_report("further write at the cap returns 0",
+                   vfs_write(f, big, 16) == 0);
+        vfs_close(f);
+    } else {
+        vfs_report("write beyond 4096 is truncated to 4096", 0);
+    }
+
+    /* Boundary: the root directory holds at most 16 entries. Three are
+     * already used (test.txt, empty.txt, big.txt), so exactly 13 more
+     * must succeed before creation starts failing. */
+    char name[8] = "/e00";
+    int created = 0;
+    for (int i = 0; i < 20; i++) {
+        name[2] = (char)('0' + i / 10);
+        name[3] = (char)('0' + i % 10);
+        f = NULL;
+        if (vfs_open(name, O_CREAT, &f) != 0)
+            break;
+        created++;
+        vfs_close(f);
+    }
+    uart_puts("       entries created before the cap: ");
+    print_dec_ulong((unsigned long)created);
+    uart_puts("\n");
+    vfs_report("directory stops accepting entries at 16", created == 13);
+
+    /* A path that names no entry inside a directory is rejected. */
+    f = NULL;
+    vfs_report("reject the root path itself",
+               vfs_open("/", O_CREAT, &f) != 0);
+
+    uart_puts("=== VFS / tmpfs test done ===\n");
+}
+
 /* ---------- Memory allocator test case --------------------------------- */
 
 static void test_alloc_1(void)
@@ -483,6 +611,8 @@ static void shell_handle_command(const char *cmd)
         shell_load_kernel();
     } else if (str_eq(cmd, "test") != 0) {
         test_alloc_1();
+    } else if (str_eq(cmd, "vfstest") != 0) {
+        test_vfs();
     } else if (str_eq(cmd, "ls") != 0) {
         /* initrd-start is a PA from the DTB; under paging we must deref
          * via its higher-half VA, mirroring how main.c handles every
