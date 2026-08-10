@@ -102,7 +102,7 @@ void trap_init(void);
  * Invoked by trap_entry with a pointer to the saved trap frame. Handles
  * ECALL_FROM_U by advancing sepc past the ecall instruction; every other
  * non-interrupt cause currently halts the kernel.
- * @param tf Pointer to the saved trap frame on the kernel stack.
+ * @param[in,out] tf Pointer to the saved trap frame on the kernel stack.
  * -------------------------------------------------------------------- */
 void trap_handler(struct trap_frame *tf);
 

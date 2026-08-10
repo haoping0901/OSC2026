@@ -40,8 +40,8 @@
  * Note: this validates mapping presence only, not prot — a PROT_NONE mmap
  * region passes here but a real access still faults in U-mode. Per-prot
  * checking is a deliberate non-goal.
- * @param p Start of the user buffer.
- * @param n Size in bytes.
+ * @param[in] p Start of the user buffer.
+ * @param     n Size in bytes.
  * @return 1 if the range is wholly inside a mapped user region, else 0.
  * -------------------------------------------------------------------- */
 static int in_user_range(const void *p, unsigned long n)
@@ -80,8 +80,8 @@ static long sys_getpid(void)
  * the UART ring is empty, return as soon as the first byte arrives,
  * and opportunistically drain up to @count more bytes if they are
  * already buffered. Validates @buf against the current image.
- * @param buf   User destination.
- * @param count Maximum bytes to read.
+ * @param[out] buf   User destination.
+ * @param      count Maximum bytes to read.
  * @return Bytes actually written into @buf, or -1 on bad arguments.
  * -------------------------------------------------------------------- */
 static long sys_uart_read(char *buf, long count)
@@ -109,8 +109,8 @@ static long sys_uart_read(char *buf, long count)
  * Uses the existing uart_putc() path which routes through the IRQ-
  * driven TX ring (or the polling fallback before PLIC is online).
  * Validates @buf against the current image.
- * @param buf   User source bytes.
- * @param count Number of bytes to write.
+ * @param[in] buf   User source bytes.
+ * @param     count Number of bytes to write.
  * @return @count on success, or -1 on bad arguments.
  * -------------------------------------------------------------------- */
 static long sys_uart_write(const char *buf, long count)
@@ -131,8 +131,8 @@ static long sys_uart_write(const char *buf, long count)
  * 0 with a clean register file — the first instruction fetch then
  * demand-faults the first image page in. Does not create a new thread;
  * the caller's pid stays the same.
- * @param path Filename inside the initial ramdisk.
- * @param tf   Trap frame on the kernel stack (will be rewritten).
+ * @param[in]     path Filename inside the initial ramdisk.
+ * @param[in,out] tf   Trap frame on the kernel stack (will be rewritten).
  * @return 0 on success, -1 on lookup / OOM failure.
  * -------------------------------------------------------------------- */
 static long sys_exec(const char *path, struct trap_frame *tf)
@@ -231,7 +231,7 @@ static long sys_exec(const char *path, struct trap_frame *tf)
  * sepc was already advanced past the ecall by trap.c BEFORE
  * do_syscall() ran, so the child resumes at the instruction after
  * the fork-call ecall, just like the parent will.
- * @param tf Parent's trap frame.
+ * @param[in] tf Parent's trap frame.
  * @return Child pid in the parent path, 0 in the child path, -1 on
  *         allocation failure.
  * -------------------------------------------------------------------- */
@@ -464,9 +464,9 @@ static long sys_stop(long pid)
  * walk off the FB, and [bmp, bmp + w*h*4) must lie inside the caller's
  * image buffer. Computes the byte length as (uint64_t)w*h*4 to avoid a
  * 32-bit overflow when w*h is close to the FB size.
- * @param bmp User-space pixel array (XRGB8888).
- * @param w   Image width in pixels.
- * @param h   Image height in pixels.
+ * @param[in] bmp User-space pixel array (XRGB8888).
+ * @param     w   Image width in pixels.
+ * @param     h   Image height in pixels.
  * @return 0 on success, -1 on argument validation failure.
  * -------------------------------------------------------------------- */
 static long sys_display(unsigned int *bmp, unsigned int w, unsigned int h)
@@ -493,7 +493,7 @@ struct usleep_token {
  * Wakes the sleeping thread that registered the timer. Safe to run
  * from the bottom-half task queue because thread_wakeup() is itself
  * IRQ-safe (sie_save_clear inside).
- * @param arg Pointer to the sleeper's stack-allocated usleep_token.
+ * @param[in] arg Pointer to the sleeper's stack-allocated usleep_token.
  * -------------------------------------------------------------------- */
 static void usleep_cb(void *arg)
 {
@@ -571,7 +571,7 @@ static long sys_kill(int pid, int signum)
  * Thin wrapper around signal_return() that lives in syscall.c so
  * do_syscall()'s switch can reach it. The heavy lifting (restoring
  * the saved trap_frame and freeing the sigstack) is in signal.c.
- * @param tf Live trap frame at trampoline ecall time.
+ * @param[in,out] tf Live trap frame at trampoline ecall time.
  * @return Original syscall return value to land in tf->a0.
  * -------------------------------------------------------------------- */
 static long sys_sigreturn(struct trap_frame *tf)
@@ -586,10 +586,10 @@ static long sys_sigreturn(struct trap_frame *tf)
  * return value (a user base VA, or MAP_FAILED == (void*)-1 on error) is
  * delivered through tf->a0 by trap.c. Only anonymous, eager mappings are
  * supported; fd/offset are absent from the ABI.
- * @param addr   Placement hint (NULL → kernel chooses).
- * @param length Requested byte length (page-rounded by do_mmap).
- * @param prot   User PROT_* bits.
- * @param flags  User MAP_* bits (MAP_ANONYMOUS required).
+ * @param[in] addr   Placement hint (NULL → kernel chooses).
+ * @param     length Requested byte length (page-rounded by do_mmap).
+ * @param     prot   User PROT_* bits.
+ * @param     flags  User MAP_* bits (MAP_ANONYMOUS required).
  * @return User base VA on success, MAP_FAILED on failure, both as long.
  * -------------------------------------------------------------------- */
 static long sys_mmap(void *addr, unsigned long length, int prot, int flags)
@@ -601,7 +601,7 @@ static long sys_mmap(void *addr, unsigned long length, int prot, int flags)
  * @brief do_syscall() – Decode tf->a7 and dispatch to the handler.
  *
  * Unknown syscall numbers return -1 so user space can detect them.
- * @param tf Trap frame on the kernel stack.
+ * @param[in,out] tf Trap frame on the kernel stack.
  * @return Value to be written into tf->a0 by trap.c.
  * -------------------------------------------------------------------- */
 long do_syscall(struct trap_frame *tf)

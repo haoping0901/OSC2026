@@ -149,10 +149,10 @@ int cpio_cat(const void *archive, const char *target_filename)
  * a pointer to the payload and its size via out-parameters. The caller
  * is responsible for copying the bytes out before the archive is freed
  * or overwritten.
- * @param archive Base of the cpio blob.
- * @param target  NUL-terminated filename to look up.
- * @param data    Out: pointer to payload bytes inside the archive.
- * @param size    Out: payload size in bytes.
+ * @param[in]  archive Base of the cpio blob.
+ * @param[in]  target  NUL-terminated filename to look up.
+ * @param[out] data    Pointer to payload bytes inside the archive.
+ * @param[out] size    Payload size in bytes.
  * @return 0 on success, -1 otherwise.
  * -------------------------------------------------------------------- */
 int cpio_find(const void *archive, const char *target,

@@ -64,7 +64,7 @@ static int lowest_bit_index(unsigned long x)
  * Word-zeroes the whole block; pending bitmap, handler table, saved
  * trap_frame and sigstack pointer are all cleared. Called from
  * thread_alloc_bare() before the thread is observable.
- * @param s State block to clear.
+ * @param[out] s State block to clear.
  * -------------------------------------------------------------------- */
 void signal_state_init(struct signal_state *s)
 {
@@ -79,8 +79,8 @@ void signal_state_init(struct signal_state *s)
  * Bracketed by sie_save_clear/restore so a timer IRQ that interrupts
  * the read-modify-write of the pending bitmap cannot leave it in a
  * torn state. The caller is responsible for argument validation.
- * @param t      Target thread.
- * @param signum Signal number in [1, NSIG).
+ * @param[in] t      Target thread.
+ * @param     signum Signal number in [1, NSIG).
  * -------------------------------------------------------------------- */
 void signal_post(struct thread *t, int signum)
 {
@@ -100,7 +100,7 @@ void signal_post(struct thread *t, int signum)
  * mid-handler leaves a clean signal state. The signal page itself is
  * owned by the process VM (t->sigpage_base) and reclaimed by the reaper,
  * so nothing is freed here.
- * @param t Thread to release.
+ * @param[in] t Thread to release.
  * -------------------------------------------------------------------- */
 void signal_release(struct thread *t)
 {
@@ -117,7 +117,7 @@ void signal_release(struct thread *t)
  * gate, and wake the parent so a pending waitpid resumes. The user
  * address space and the thread struct/kstack are reclaimed later by the
  * reaper, after satp has switched away from @t.
- * @param t Thread to terminate (may be the current thread).
+ * @param[in] t Thread to terminate (may be the current thread).
  * -------------------------------------------------------------------- */
 void signal_default_terminate(struct thread *t)
 {
@@ -150,7 +150,7 @@ void signal_default_terminate(struct thread *t)
  * into the kernel via syscall #11. fence.i is issued so the CPU sees
  * the freshly written code on first execution (matters on real silicon
  * with split I/D caches; harmless under QEMU).
- * @param stack_base Low address of the sigstack buffer.
+ * @param[out] stack_base Low address of the sigstack buffer.
  * -------------------------------------------------------------------- */
 static void plant_sigreturn_trampoline(void *stack_base)
 {
@@ -179,7 +179,7 @@ static void plant_sigreturn_trampoline(void *stack_base)
  *
  * tf->a0 is set to the signum so handlers declared `void(int)` see it;
  * `void()` handlers simply ignore the extra argument.
- * @param tf Trap frame about to be restored by trap_return_user.
+ * @param[in,out] tf Trap frame about to be restored by trap_return_user.
  * -------------------------------------------------------------------- */
 void signal_check_and_dispatch(struct trap_frame *tf)
 {
@@ -252,7 +252,8 @@ void signal_check_and_dispatch(struct trap_frame *tf)
  *
  * If no handler was active (user faked a sigreturn) returns -1 and
  * leaves the trap_frame untouched.
- * @param tf Live trap frame currently representing the trampoline ecall.
+ * @param[in,out] tf Live trap frame currently representing the trampoline
+ *                   ecall.
  * @return saved a0 on success, -1 on misuse.
  * -------------------------------------------------------------------- */
 long signal_return(struct trap_frame *tf)

@@ -108,9 +108,9 @@ void timer_init(void)
  * and reprograms the hardware timer when the new node becomes the
  * earliest. Runs the queue mutation with sstatus.SIE cleared so the
  * timer IRQ handler cannot race against the walker.
- * @param callback Function to invoke in IRQ context on expiry.
- * @param arg      Opaque pointer handed to the callback verbatim.
- * @param ticks    Delay in timebase ticks.
+ * @param     callback Function to invoke in IRQ context on expiry.
+ * @param[in] arg      Opaque pointer handed to the callback verbatim.
+ * @param     ticks    Delay in timebase ticks.
  * -------------------------------------------------------------------- */
 static void add_timer_ticks(void (*callback)(void *), void *arg,
                             uint64_t ticks)
@@ -151,9 +151,9 @@ static void add_timer_ticks(void (*callback)(void *), void *arg,
  * @brief add_timer() – Register a one-shot callback after @sec seconds.
  *
  * Thin second-granularity wrapper over add_timer_ticks().
- * @param callback Function to invoke in IRQ context on expiry.
- * @param arg      Opaque pointer handed to the callback verbatim.
- * @param sec      Delay in whole seconds.
+ * @param     callback Function to invoke in IRQ context on expiry.
+ * @param[in] arg      Opaque pointer handed to the callback verbatim.
+ * @param     sec      Delay in whole seconds.
  * -------------------------------------------------------------------- */
 void add_timer(void (*callback)(void *), void *arg, int sec)
 {
@@ -167,9 +167,9 @@ void add_timer(void (*callback)(void *), void *arg, int sec)
  * before delegating to add_timer_ticks(). Sub-tick delays are rounded
  * down to zero ticks, in which case the callback fires on the very
  * next timer IRQ.
- * @param callback Function to invoke in IRQ context on expiry.
- * @param arg      Opaque pointer handed to the callback verbatim.
- * @param usec     Delay in microseconds.
+ * @param     callback Function to invoke in IRQ context on expiry.
+ * @param[in] arg      Opaque pointer handed to the callback verbatim.
+ * @param     usec     Delay in microseconds.
  * -------------------------------------------------------------------- */
 void add_timer_us(void (*callback)(void *), void *arg, uint64_t usec)
 {

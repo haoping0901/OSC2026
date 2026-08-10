@@ -80,7 +80,7 @@ static void demo_thread_body(void)
  * Bottom-half callback used by the taskdemo command. The integer
  * priority is smuggled through the void* arg via uintptr_t cast so
  * the demo does not need to allocate per-task context.
- * @param arg Priority value (cast through uintptr_t) stamped on output.
+ * @param[in] arg Priority value (cast through uintptr_t) stamped on output.
  * -------------------------------------------------------------------- */
 static void demo_task_short(void *arg)
 {
@@ -128,7 +128,7 @@ struct setto_ctx {
  * timer_get_timebase_freq()) alongside the stashed message, then
  * frees the context. Safe to block briefly on UART because uart_putc
  * already masks SIE while it touches its ring.
- * @param arg Pointer to a kmalloc'd struct setto_ctx (transferred in).
+ * @param[in] arg Pointer to a kmalloc'd struct setto_ctx (transferred in).
  * -------------------------------------------------------------------- */
 static void setto_cb(void *arg)
 {
@@ -156,7 +156,7 @@ static void setto_cb(void *arg)
  * message runs to end-of-line; shell_handle_command() already NUL-
  * terminates at '\n'. The message is copied into a kmalloc'd context
  * because the readline buffer is reused on the next keystroke.
- * @param args Command tail (the characters after "setTimeout ").
+ * @param[in] args Command tail (the characters after "setTimeout ").
  * -------------------------------------------------------------------- */
 static void shell_set_timeout(const char *args)
 {
@@ -210,7 +210,7 @@ static void shell_set_timeout(const char *args)
  * new thread starts running; it later exits on its own and the idle
  * thread reaps its kernel stack. Multiple `exec` invocations therefore
  * coexist as concurrent user processes.
- * @param name Filename inside the initial ramdisk.
+ * @param[in] name Filename inside the initial ramdisk.
  * -------------------------------------------------------------------- */
 static void run_user_program(const char *name)
 {
@@ -238,7 +238,7 @@ static void run_user_program(const char *name)
  *
  * Wraps sys_stop()'s logic for use from kernel context (without going
  * through ecall). Useful for verifying §4.6 of the plan.
- * @param args Command tail (decimal pid).
+ * @param[in] args Command tail (decimal pid).
  * -------------------------------------------------------------------- */
 static void shell_stop_pid(const char *args)
 {
@@ -285,7 +285,7 @@ static void shell_stop_pid(const char *args)
  * Parses "kill <pid> <signum>" and calls signal_post() directly on the
  * target. Bypasses sys_kill() because the shell runs in S-mode and
  * cannot issue ecalls to itself; the effect on the target is identical.
- * @param args Command tail after "kill ".
+ * @param[in] args Command tail after "kill ".
  * -------------------------------------------------------------------- */
 static void shell_kill_pid(const char *args)
 {
@@ -340,8 +340,8 @@ static void shell_kill_pid(const char *args)
  *
  * Keeps the test body free of repeated formatting so each check reads
  * as a single assertion.
- * @param name Description of the check.
- * @param ok   Non-zero when the check succeeded.
+ * @param[in] name Description of the check.
+ * @param     ok   Non-zero when the check succeeded.
  * -------------------------------------------------------------------- */
 static void vfs_report(const char *name, int ok)
 {
@@ -432,9 +432,17 @@ static void test_vfs(void)
         vfs_report("write beyond 4096 is truncated to 4096", 0);
     }
 
+    /* The two root-level directories the multi-level checks need are
+     * created here, before the entry cap is reached: once the root is
+     * full every mkdir would fail for lack of a free slot rather than
+     * for the reason actually under test. */
+    vfs_report("mkdir /dir1", vfs_mkdir("/dir1") == 0);
+    vfs_report("mkdir /mnt", vfs_mkdir("/mnt") == 0);
+
     /* Boundary: the root directory holds at most 16 entries. Three are
-     * already used (test.txt, empty.txt, big.txt), so exactly 13 more
-     * must succeed before creation starts failing. */
+     * already used (test.txt, empty.txt, big.txt) and the two
+     * directories just above take two more, so exactly 11 further
+     * entries must succeed before creation starts failing. */
     char name[8] = "/e00";
     int created = 0;
     for (int i = 0; i < 20; i++) {
@@ -449,15 +457,116 @@ static void test_vfs(void)
     uart_puts("       entries created before the cap: ");
     print_dec_ulong((unsigned long)created);
     uart_puts("\n");
-    vfs_report("directory stops accepting entries at 16", created == 13);
+    vfs_report("directory stops accepting entries at 16", created == 11);
 
     /* A path that names no entry inside a directory is rejected. */
     f = NULL;
     vfs_report("reject the root path itself",
                vfs_open("/", O_CREAT, &f) != 0);
 
+    /* ---- Multi-level VFS ---------------------------------------------
+     * /dir1 and /mnt already exist: they had to be created before the
+     * root filled up. Everything below either nests inside them or is
+     * expected to fail, so the full root does not distort the results. */
+    uart_puts("--- multi-level ---\n");
+
+    /* Creating a directory whose name is taken must not succeed. */
+    vfs_report("mkdir /dir1 twice fails", vfs_mkdir("/dir1") != 0);
+
+    /* A directory nested inside a directory. */
+    vfs_report("mkdir /dir1/dir2", vfs_mkdir("/dir1/dir2") == 0);
+
+    /* An intermediate component that does not exist stops the walk. */
+    vfs_report("mkdir under a missing parent fails",
+               vfs_mkdir("/nodir/x") != 0);
+
+    /* A file two levels down: create, write, close, reopen, read back. */
+    const char *deep = "deep file";
+    int deep_len = 9;
+    f = NULL;
+    if (vfs_open("/dir1/dir2/f.txt", O_CREAT, &f) == 0 && f) {
+        vfs_report("write into /dir1/dir2/f.txt",
+                   vfs_write(f, deep, (size_t)deep_len) == deep_len);
+        vfs_close(f);
+
+        f = NULL;
+        for (int i = 0; i < (int)sizeof(buf); i++)
+            buf[i] = '\0';
+        if (vfs_open("/dir1/dir2/f.txt", 0, &f) == 0 && f) {
+            vfs_report("read back /dir1/dir2/f.txt",
+                       vfs_read(f, buf, sizeof(buf) - 1) == deep_len &&
+                       str_eq(buf, deep));
+            vfs_close(f);
+        } else {
+            vfs_report("read back /dir1/dir2/f.txt", 0);
+        }
+    } else {
+        vfs_report("write into /dir1/dir2/f.txt", 0);
+        vfs_report("read back /dir1/dir2/f.txt", 0);
+    }
+
+    /* vfs_lookup() resolves a full path; "/" names the root itself. */
+    struct vnode *node = NULL;
+    vfs_report("lookup /dir1/dir2", vfs_lookup("/dir1/dir2", &node) == 0);
+    node = NULL;
+    vfs_report("lookup a missing entry fails",
+               vfs_lookup("/dir1/none", &node) != 0);
+    node = NULL;
+    vfs_report("lookup / returns the root",
+               vfs_lookup("/", &node) == 0 && node == g_rootfs->root);
+
+    /* Mounting: a fresh tmpfs onto the existing /mnt directory. The
+     * file created first is what the mount must shadow. */
+    f = NULL;
+    vfs_report("create /mnt/shadow.txt before mounting",
+               vfs_open("/mnt/shadow.txt", O_CREAT, &f) == 0 && f != NULL);
+    if (f)
+        vfs_close(f);
+
+    vfs_report("mount an unknown fs fails",
+               vfs_mount("/mnt", "nosuchfs") != 0);
+    vfs_report("mount onto a missing path fails",
+               vfs_mount("/notexist", "tmpfs") != 0);
+
+    /* A regular file cannot be covered: nothing could ever be looked up
+     * inside the result. */
+    vfs_report("mount onto a regular file fails",
+               vfs_mount("/test.txt", "tmpfs") != 0);
+
+    vfs_report("mount tmpfs at /mnt", vfs_mount("/mnt", "tmpfs") == 0);
+    vfs_report("mount at /mnt twice fails",
+               vfs_mount("/mnt", "tmpfs") != 0);
+
+    /* Crossing the mount point: /mnt now resolves to the new mount's
+     * root, so the vnode belongs to a different mount than the rootfs. */
+    node = NULL;
+    vfs_report("lookup /mnt crosses into the mounted fs",
+               vfs_lookup("/mnt", &node) == 0 && node != NULL &&
+               node->mount != g_rootfs);
+
+    /* The entry created before the mount is hidden by it. */
+    f = NULL;
+    vfs_report("the mount shadows /mnt/shadow.txt",
+               vfs_open("/mnt/shadow.txt", 0, &f) != 0);
+
+    /* A file created below the mount point lands in the mounted fs. */
+    f = NULL;
+    if (vfs_open("/mnt/inner.txt", O_CREAT, &f) == 0 && f) {
+        vfs_report("write into the mounted fs",
+                   vfs_write(f, "inner", 5) == 5);
+        vfs_close(f);
+
+        node = NULL;
+        vfs_report("/mnt/inner.txt belongs to the mounted fs",
+                   vfs_lookup("/mnt/inner.txt", &node) == 0 &&
+                   node != NULL && node->mount != g_rootfs);
+    } else {
+        vfs_report("write into the mounted fs", 0);
+        vfs_report("/mnt/inner.txt belongs to the mounted fs", 0);
+    }
+
     uart_puts("=== VFS / tmpfs test done ===\n");
-}
+}    /* test_vfs */
 
 /* ---------- Memory allocator test case --------------------------------- */
 

@@ -48,7 +48,7 @@ struct signal_state {
  * Called from thread_alloc_bare() so every new thread starts with no
  * pending signals, no registered handlers, no active sigstack and the
  * in_handler gate cleared.
- * @param s State block to clear.
+ * @param[out] s State block to clear.
  * -------------------------------------------------------------------- */
 void signal_state_init(struct signal_state *s);
 
@@ -59,8 +59,8 @@ void signal_state_init(struct signal_state *s);
  * read-modify-write cannot be torn by an interrupt. Does not wake the
  * target — delivery happens the next time the target is about to
  * return to U-mode.
- * @param t      Target thread (must be a user process).
- * @param signum Signal number in [1, NSIG).
+ * @param[in] t      Target thread (must be a user process).
+ * @param     signum Signal number in [1, NSIG).
  * -------------------------------------------------------------------- */
 void signal_post(struct thread *t, int signum);
 
@@ -75,7 +75,7 @@ void signal_post(struct thread *t, int signum);
  *   - user fn  → snapshots tf, allocates a sigstack, plants the
  *                sigreturn trampoline, and rewrites tf to land in U at
  *                the handler with ra pointing at the trampoline.
- * @param tf Trap frame about to be restored by trap_return_user.
+ * @param[in,out] tf Trap frame about to be restored by trap_return_user.
  * -------------------------------------------------------------------- */
 void signal_check_and_dispatch(struct trap_frame *tf);
 
@@ -87,7 +87,7 @@ void signal_check_and_dispatch(struct trap_frame *tf);
  * the in_handler gate. The returned long is whatever the do_syscall()
  * dispatcher will write back to tf->a0 — we return saved.a0 so the
  * original a0 (already in tf after the *tf = saved copy) survives.
- * @param tf Trap frame currently in U-handler context.
+ * @param[in,out] tf Trap frame currently in U-handler context.
  * @return The original syscall return value, or -1 if no handler was
  *         active (i.e. user faked a sigreturn).
  * -------------------------------------------------------------------- */
@@ -100,7 +100,7 @@ long signal_return(struct trap_frame *tf);
  * from the runq if READY, marks it ZOMBIE, frees its image, wakes the
  * parent if blocked in waitpid. Used by signal_check_and_dispatch()
  * when the handler slot is SIG_DFL/NULL and also by the OOM fallback.
- * @param t Thread to terminate.
+ * @param[in] t Thread to terminate.
  * -------------------------------------------------------------------- */
 void signal_default_terminate(struct thread *t);
 
@@ -111,7 +111,7 @@ void signal_default_terminate(struct thread *t);
  * re-imaging mid-handler leaves a clean signal state. The signal page
  * itself is owned by the process VM (thread->sigpage_base) and reclaimed
  * separately, so nothing is freed here. Safe to call unconditionally.
- * @param t Thread whose signal state should be quiesced.
+ * @param[in] t Thread whose signal state should be quiesced.
  * -------------------------------------------------------------------- */
 void signal_release(struct thread *t);
 

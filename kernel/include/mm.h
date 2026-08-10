@@ -271,11 +271,11 @@ void vma_free_list(struct list_head *head);
  * carrying the converted prot. No frame is allocated and no PTE is
  * installed here; the first access page-faults and do_page_fault()
  * populates one page at a time.
- * @param t      Target (calling) thread; must have a valid t->pgd.
- * @param addr   Placement hint (may be 0 / unaligned / overlapping).
- * @param length Requested byte length (rounded up to a page).
- * @param prot   User PROT_* bits.
- * @param flags  User MAP_* bits (MAP_ANONYMOUS required).
+ * @param[in] t      Target (calling) thread; must have a valid t->pgd.
+ * @param[in] addr   Placement hint (may be 0 / unaligned / overlapping).
+ * @param     length Requested byte length (rounded up to a page).
+ * @param     prot   User PROT_* bits.
+ * @param     flags  User MAP_* bits (MAP_ANONYMOUS required).
  * @return User base VA on success, MAP_FAILED on failure.
  */
 void *do_mmap(struct thread *t, void *addr, unsigned long length,

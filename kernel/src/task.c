@@ -36,9 +36,9 @@ static int g_running_priority = TASK_PRIO_IDLE;
  * half-linked list. Same-priority entries keep FIFO order because the
  * walk stops only when it sees a strictly lower priority (= larger
  * value).
- * @param cb       Function to invoke in bottom-half context.
- * @param arg      Opaque pointer handed verbatim to @cb.
- * @param priority Smaller value = higher priority.
+ * @param     cb       Function to invoke in bottom-half context.
+ * @param[in] arg      Opaque pointer handed verbatim to @cb.
+ * @param     priority Smaller value = higher priority.
  * @return 0 on success, -1 on allocation failure.
  * -------------------------------------------------------------------- */
 int add_task(task_callback_t cb, void *arg, int priority)

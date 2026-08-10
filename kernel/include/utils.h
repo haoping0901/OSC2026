@@ -12,9 +12,9 @@ void print_dec_ulong(unsigned long x);
  *
  * The kernel is built with -nostdlib so a minimal copy helper lives in
  * utils instead of libc. Does not handle overlapping regions.
- * @param dst Destination buffer (must be writable).
- * @param src Source bytes.
- * @param n   Number of bytes to copy.
+ * @param[out] dst Destination buffer (must be writable).
+ * @param[in]  src Source bytes.
+ * @param      n   Number of bytes to copy.
  * @return Original @dst pointer.
  * -------------------------------------------------------------------- */
 void *mem_cpy(void *dst, const void *src, unsigned long n);

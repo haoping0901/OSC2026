@@ -45,7 +45,7 @@ void trap_set_user_base(uintptr_t base)
  * the default handler kills the current thread, we re-enter
  * schedule() so the kernel never sret's into a dead user image; the
  * call never returns from the dead thread's perspective.
- * @param tf Trap frame about to be restored by trap_return_user.
+ * @param[in,out] tf Trap frame about to be restored by trap_return_user.
  * -------------------------------------------------------------------- */
 static void deliver_pending_signal(struct trap_frame *tf)
 {
@@ -91,7 +91,7 @@ void trap_init(void)
  * Prints the diagnostic CSR trio (scause / sepc / stval). For an
  * ecall taken from U-mode (scause = 8), advances sepc by 4 so that
  * the eventual sret resumes at the instruction after ecall.
- * @param tf Pointer to the trap frame saved by trap_entry.
+ * @param[in,out] tf Pointer to the trap frame saved by trap_entry.
  * -------------------------------------------------------------------- */
 void trap_handler(struct trap_frame *tf)
 {

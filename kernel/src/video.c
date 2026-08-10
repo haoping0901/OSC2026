@@ -99,9 +99,9 @@ struct QEMU_PACKED FWCfgDmaAccess {
  * Local replacement for libc strncmp(): the kernel is built with
  * -nostdlib and we only need the "stop on first difference or first
  * NUL" semantics for fw_cfg directory walking.
- * @param a First buffer.
- * @param b Second buffer.
- * @param n Maximum bytes to inspect.
+ * @param[in] a First buffer.
+ * @param[in] b Second buffer.
+ * @param     n Maximum bytes to inspect.
  * @return 0 if equal up to @n bytes (or to a NUL), non-zero otherwise.
  * -------------------------------------------------------------------- */
 static int mem_ncmp(const char *a, const char *b, int n)
@@ -129,9 +129,9 @@ static int mem_ncmp(const char *a, const char *b, int n)
  * addresses, so both the buffer and the on-stack descriptor are converted
  * from their kernel VAs back to PAs (higher-half paging) before being
  * handed to the device.
- * @param address User buffer (read into / written from).
- * @param length  Bytes to transfer.
- * @param control fw_cfg control word (already in host byte order).
+ * @param[in,out] address User buffer (read into / written from).
+ * @param         length  Bytes to transfer.
+ * @param         control fw_cfg control word (already in host byte order).
  * -------------------------------------------------------------------- */
 static void fw_cfg_dma_transfer(void *address, uint32_t length,
                                 uint32_t control)
@@ -148,9 +148,9 @@ static void fw_cfg_dma_transfer(void *address, uint32_t length,
 
 /** ----------------------------------------------------------------------
  * @brief fw_cfg_read_entry() – Select entry @e and DMA-read it.
- * @param buf Destination buffer.
- * @param e   fw_cfg entry id.
- * @param len Bytes to read.
+ * @param[out] buf Destination buffer.
+ * @param      e   fw_cfg entry id.
+ * @param      len Bytes to read.
  * -------------------------------------------------------------------- */
 static void fw_cfg_read_entry(void *buf, int e, int len)
 {
@@ -161,9 +161,9 @@ static void fw_cfg_read_entry(void *buf, int e, int len)
 
 /** ----------------------------------------------------------------------
  * @brief fw_cfg_write_entry() – Select entry @e and DMA-write to it.
- * @param buf Source buffer.
- * @param e   fw_cfg entry id.
- * @param len Bytes to write.
+ * @param[in] buf Source buffer.
+ * @param     e   fw_cfg entry id.
+ * @param     len Bytes to write.
  * -------------------------------------------------------------------- */
 static void fw_cfg_write_entry(void *buf, int e, int len)
 {
@@ -178,7 +178,7 @@ static void fw_cfg_write_entry(void *buf, int e, int len)
  * Reads the directory header, then streams the file entries one by one
  * (the device auto-advances after the directory header read), comparing
  * each name against @name. Returns the first matching entry's selector.
- * @param name Slash-separated fw_cfg file name (e.g. "etc/ramfb").
+ * @param[in] name Slash-separated fw_cfg file name (e.g. "etc/ramfb").
  * @return Selector id on success, -1 if not found.
  * -------------------------------------------------------------------- */
 static int fw_cfg_find_file(const char *name)
@@ -215,8 +215,8 @@ static int fw_cfg_find_file(const char *name)
  * compiler/CPU cannot reorder the stores around the flush. On QEMU
  * cbo.flush is a no-op (everything is coherent) and the loop is
  * harmless; on OPI-RV2 it is required so the GPU sees the new pixels.
- * @param addr Start byte address.
- * @param len  Number of bytes covered.
+ * @param[in] addr Start byte address.
+ * @param     len  Number of bytes covered.
  * -------------------------------------------------------------------- */
 static void flush_dcache(void *addr, unsigned long len)
 {
@@ -265,9 +265,9 @@ void video_init(void)
  * framebuffer, centered. Each row is mem_cpy'd then flushed; rows are
  * independent so a timer IRQ between rows is harmless (worst case: one
  * frame of tearing on the next refresh, which the spec accepts).
- * @param bmp_image Pointer to width*height XRGB8888 pixels.
- * @param width     Pixel width of the source image.
- * @param height    Pixel height of the source image.
+ * @param[in] bmp_image Pointer to width*height XRGB8888 pixels.
+ * @param     width     Pixel width of the source image.
+ * @param     height    Pixel height of the source image.
  * -------------------------------------------------------------------- */
 void video_bmp_display(unsigned int *bmp_image, int width, int height)
 {

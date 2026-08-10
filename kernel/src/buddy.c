@@ -215,11 +215,12 @@ static void block_pop(unsigned long idx, int order)
  * themselves are left empty here and populated later, once all buddy_reserve()
  * calls have carved out the unavailable ranges.
  *
- * @param base            Physical base address of the managed region.
- * @param size            Size of the managed region in bytes.
- * @param ext_frame_array Caller-provided per-frame state array.
- * @param ext_ref_array   Caller-provided per-frame reference-count array.
- * @param frame_count     Number of frames covered by the arrays.
+ * @param      base            Physical base address of the managed region.
+ * @param      size            Size of the managed region in bytes.
+ * @param[out] ext_frame_array Caller-provided per-frame state array.
+ * @param[out] ext_ref_array   Caller-provided per-frame reference-count
+ *                             array.
+ * @param      frame_count     Number of frames covered by the arrays.
  * ---------------------------------------------------------------------------
  */
 void buddy_init(uintptr_t base, uintptr_t size,
@@ -471,7 +472,7 @@ void buddy_free(void *ptr)
  * that owner later drops the reference. The increment is bracketed
  * against S-mode interrupts for the same reason as the dec-and-test in
  * buddy_free(): sharers may race through preemption.
- * @param ptr Linear-map VA of the block head.
+ * @param[in] ptr Linear-map VA of the block head.
  * -------------------------------------------------------------------- */
 void buddy_ref_inc(void *ptr)
 {
@@ -495,7 +496,7 @@ void buddy_ref_inc(void *ptr)
  * Single-word read, no locking: on a single hart a snapshot is enough
  * for the copy-on-write "sole owner?" decision — a count of 1 cannot
  * concurrently grow, because only the sole owner itself could fork.
- * @param ptr Linear-map VA of the block head.
+ * @param[in] ptr Linear-map VA of the block head.
  * @return Current reference count, or 0 if @ptr is out of range.
  * -------------------------------------------------------------------- */
 unsigned int buddy_ref_read(void *ptr)

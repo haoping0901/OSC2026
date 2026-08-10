@@ -123,8 +123,9 @@ static inline unsigned long leaf_prot(unsigned long pa)
  * @gib_base, each a 2 MiB identity leaf (PPN = PA >> 12). The same table is
  * referenced by both the identity and the higher-half PGD entry, so a
  * single physical PMD table serves VA==PA and VA==PA+offset simultaneously.
- * @param table   PMD table (512 entries) to fill.
- * @param gib_base Physical base address of the 1 GiB region (PGD-aligned).
+ * @param[out] table    PMD table (512 entries) to fill.
+ * @param      gib_base Physical base address of the 1 GiB region
+ *                      (PGD-aligned).
  * -------------------------------------------------------------------- */
 static void map_linear_range(unsigned long *table, unsigned long gib_base)
 {
@@ -208,7 +209,7 @@ unsigned long *kernel_pgd(void)
  *
  * Freestanding replacement for memset(0) on a freshly buddy_alloc'd
  * page-table page. @p must be PAGE_SIZE aligned and PAGE_SIZE long.
- * @param p Page to clear.
+ * @param[out] p Page to clear.
  * -------------------------------------------------------------------- */
 static void zero_page(void *p)
 {
@@ -249,8 +250,8 @@ unsigned long *pgd_alloc(void)
  * zeroes a new table, links it as a pointer PTE (V only, R=W=X=0), and
  * returns it. Tables live in the linear map, so PA<->VA uses
  * phys_to_virt()/virt_to_phys().
- * @param table Current-level table (kernel VA).
- * @param idx   Entry index within @table.
+ * @param[in] table Current-level table (kernel VA).
+ * @param     idx   Entry index within @table.
  * @return Kernel VA of the next-level table, or NULL on OOM.
  * -------------------------------------------------------------------- */
 static unsigned long *walk_or_create(unsigned long *table, unsigned long idx)
@@ -275,11 +276,11 @@ static unsigned long *walk_or_create(unsigned long *table, unsigned long idx)
  * with PPN = pa>>12 and flags @prot. Inputs must be PAGE_SIZE aligned.
  * On OOM the partial mapping is left in place; the caller tears the
  * whole address space down via uvm_destroy().
- * @param pgd  Root page table (kernel VA).
- * @param va   Virtual base (PAGE_SIZE aligned).
- * @param size Byte length (PAGE_SIZE aligned).
- * @param pa   Physical base (PAGE_SIZE aligned).
- * @param prot Leaf PTE flag bits (must include PTE_V).
+ * @param[in] pgd  Root page table (kernel VA).
+ * @param     va   Virtual base (PAGE_SIZE aligned).
+ * @param     size Byte length (PAGE_SIZE aligned).
+ * @param     pa   Physical base (PAGE_SIZE aligned).
+ * @param     prot Leaf PTE flag bits (must include PTE_V).
  * @return 0 on success, -1 on OOM.
  * -------------------------------------------------------------------- */
 int map_pages(unsigned long *pgd, unsigned long va, unsigned long size,
@@ -306,8 +307,8 @@ int map_pages(unsigned long *pgd, unsigned long va, unsigned long size,
  * Descends PGD->PMD->PTE for @va without creating tables. Used by the
  * fault handler (is the leaf already present?) and by fork (which pages
  * did the parent actually populate?).
- * @param pgd Root page table (kernel VA).
- * @param va  Virtual address to resolve (any offset within the page).
+ * @param[in] pgd Root page table (kernel VA).
+ * @param     va  Virtual address to resolve (any offset within the page).
  * @return Pointer to the leaf PTE slot, or NULL if an intermediate
  *         table is absent. The slot may hold an invalid PTE; callers
  *         test *slot & PTE_V.
@@ -341,7 +342,7 @@ unsigned long *pt_lookup(unsigned long *pgd, unsigned long va)
  * buddy_alloc'd 4 KiB page (no 2 MiB user leaves exist), so per-leaf
  * buddy_free is safe. The shared kernel high half (>= KERNEL_PGD_HALF)
  * is never touched.
- * @param pgd Root page table whose user half is to be freed.
+ * @param[in] pgd Root page table whose user half is to be freed.
  * -------------------------------------------------------------------- */
 void uvm_destroy(unsigned long *pgd)
 {
@@ -372,7 +373,7 @@ void uvm_destroy(unsigned long *pgd)
  * Frees the user-half tables via uvm_destroy() then returns the PGD
  * page to the buddy allocator. Caller must ensure satp no longer points
  * at @pgd (see the reap-point reclamation in sched.c).
- * @param pgd Root page table to free.
+ * @param[in] pgd Root page table to free.
  * -------------------------------------------------------------------- */
 void pgd_free(unsigned long *pgd)
 {
@@ -387,7 +388,7 @@ void pgd_free(unsigned long *pgd)
  * sfence.vma to drop stale TLB entries. The kernel high half is
  * identical across all PGDs, so the currently executing kernel code and
  * stack remain valid across the switch.
- * @param pgd_va Kernel VA of the PGD to install.
+ * @param[in] pgd_va Kernel VA of the PGD to install.
  * -------------------------------------------------------------------- */
 void mm_set_satp(unsigned long *pgd_va)
 {
@@ -420,12 +421,12 @@ static inline unsigned long mmap_round_up_page(unsigned long n)
  * @prot is already a leaf PTE flag set (incl. PTE_U); it is stored
  * verbatim so the fault handler needs no re-conversion. The node is
  * pure metadata: no frame is allocated here.
- * @param va       User virtual base (PAGE_SIZE aligned).
- * @param len      Byte length (PAGE_SIZE aligned).
- * @param prot     Leaf PTE flag bits.
- * @param file_src Initrd bytes backing the region (NULL for anonymous).
- * @param file_len Bytes available at @file_src.
- * @param is_mmap  1 for mmap()'d regions, 0 for image/stack/sigpage.
+ * @param     va       User virtual base (PAGE_SIZE aligned).
+ * @param     len      Byte length (PAGE_SIZE aligned).
+ * @param     prot     Leaf PTE flag bits.
+ * @param[in] file_src Initrd bytes backing the region (NULL for anonymous).
+ * @param     file_len Bytes available at @file_src.
+ * @param     is_mmap  1 for mmap()'d regions, 0 for image/stack/sigpage.
  * @return New vma, or NULL on OOM.
  * -------------------------------------------------------------------- */
 struct vma *vma_alloc(unsigned long va, unsigned long len,
@@ -450,8 +451,8 @@ struct vma *vma_alloc(unsigned long va, unsigned long len,
  *
  * Linear scan of the (short, va-ascending) vma_list for a half-open
  * [va, va+len) interval containing @addr.
- * @param t    Thread whose vma_list to scan.
- * @param addr User virtual address (any offset within a region).
+ * @param[in] t    Thread whose vma_list to scan.
+ * @param     addr User virtual address (any offset within a region).
  * @return Covering vma, or NULL if @addr is outside every region.
  * -------------------------------------------------------------------- */
 struct vma *vma_find(struct thread *t, unsigned long addr)
@@ -472,8 +473,8 @@ struct vma *vma_find(struct thread *t, unsigned long addr)
  * inserts before it, preserving ascending order so gap searches and
  * overlap checks are single-pass. The list is short (a few regions), so
  * O(n) insertion is fine.
- * @param t   Owning thread.
- * @param vma Node to link (its va field decides position).
+ * @param[in] t   Owning thread.
+ * @param[in] vma Node to link (its va field decides position).
  * -------------------------------------------------------------------- */
 void vma_insert_sorted(struct thread *t, struct vma *vma)
 {
@@ -493,9 +494,9 @@ void vma_insert_sorted(struct thread *t, struct vma *vma)
  * Half-open interval intersection over the whole vma_list. Used both by
  * the hint path (reject an overlapping hint) and the top-down search
  * (skip occupied gaps).
- * @param t    Thread whose vma_list to scan.
- * @param base Candidate base VA.
- * @param len  Candidate byte length.
+ * @param[in] t    Thread whose vma_list to scan.
+ * @param     base Candidate base VA.
+ * @param     len  Candidate byte length.
  * @return 1 if any VMA overlaps, 0 if the range is free.
  * -------------------------------------------------------------------- */
 static int vma_overlaps(struct thread *t, unsigned long base,
@@ -523,9 +524,9 @@ static int vma_overlaps(struct thread *t, unsigned long base,
  * the signal page (mmap_top is initialised one guard page below SIGPAGE_VA;
  * see MMAP_CURSOR_INIT). USER_CODE_VA (0) is the low bound; running below
  * it means the address space is exhausted.
- * @param t    Calling thread.
- * @param hint User-supplied address hint (0 if none).
- * @param len  Page-rounded length to place.
+ * @param[in] t    Calling thread.
+ * @param     hint User-supplied address hint (0 if none).
+ * @param     len  Page-rounded length to place.
  * @return Chosen base VA, or 0 if no space.
  * -------------------------------------------------------------------- */
 static unsigned long mmap_find_va(struct thread *t, unsigned long hint,
@@ -584,11 +585,11 @@ static unsigned long mmap_prot_to_pte(int prot)
  * the converted prot. No frame is allocated and no PTE is installed, so
  * no sfence.vma is needed either; the first touch faults and
  * do_page_fault() populates one zeroed page at a time.
- * @param t      Calling thread (valid t->pgd required).
- * @param addr   Placement hint.
- * @param length Requested length (rounded up to a page).
- * @param prot   User PROT_* bits.
- * @param flags  User MAP_* bits (MAP_ANONYMOUS required).
+ * @param[in] t      Calling thread (valid t->pgd required).
+ * @param[in] addr   Placement hint.
+ * @param     length Requested length (rounded up to a page).
+ * @param     prot   User PROT_* bits.
+ * @param     flags  User MAP_* bits (MAP_ANONYMOUS required).
  * @return User base VA, or MAP_FAILED on bad args / OOM.
  * -------------------------------------------------------------------- */
 void *do_mmap(struct thread *t, void *addr, unsigned long length,
@@ -622,7 +623,7 @@ void *do_mmap(struct thread *t, void *addr, unsigned long length,
  * by the page table and freed by uvm_destroy()/pgd_free(), the single
  * teardown path shared by exit-reap, exec and fork rollback (any second
  * owner here would double-free).
- * @param head List head of VMAs to release.
+ * @param[in] head List head of VMAs to release.
  * -------------------------------------------------------------------- */
 void vma_free_list(struct list_head *head)
 {
@@ -638,7 +639,7 @@ void vma_free_list(struct list_head *head)
  *
  * Thin wrapper that drains t->vma_list via vma_free_list(). Frames and
  * page tables are reclaimed separately by pgd_free().
- * @param t Thread whose VMAs are to be released.
+ * @param[in] t Thread whose VMAs are to be released.
  * -------------------------------------------------------------------- */
 void vma_unmap_all(struct thread *t)
 {
@@ -652,8 +653,8 @@ void vma_unmap_all(struct thread *t)
  * hangs off @dst, then re-initialises t->vma_list to empty. No nodes are
  * freed. @dst must be an empty, initialised list head. Used by sys_exec()
  * to set the old address space's VMAs aside before building the new one.
- * @param t   Thread whose list is moved out.
- * @param dst Destination head (empty on entry).
+ * @param[in]  t   Thread whose list is moved out.
+ * @param[out] dst Destination head (empty on entry).
  * -------------------------------------------------------------------- */
 void vma_detach_all(struct thread *t, struct list_head *dst)
 {
@@ -676,8 +677,8 @@ void vma_detach_all(struct thread *t, struct list_head *dst)
  * Inverse of vma_detach_all(); the sys_exec() failure path uses it to put
  * the old region list back after the new image build failed (and left
  * t->vma_list empty). No nodes are freed. @t->vma_list must be empty.
- * @param t   Thread to restore the list onto.
- * @param src Saved list head holding the detached VMAs.
+ * @param[in] t   Thread to restore the list onto.
+ * @param[in] src Saved list head holding the detached VMAs.
  * -------------------------------------------------------------------- */
 void vma_reattach(struct thread *t, struct list_head *src)
 {
@@ -704,9 +705,9 @@ void vma_reattach(struct thread *t, struct list_head *src)
  * VMA's prot, and flushes the stale translation for that address only.
  * fence.i is issued before the mapping goes live so an executable page
  * is coherent with the I-cache on real silicon.
- * @param t    Faulting thread (valid t->pgd).
- * @param v    VMA covering @addr (permission already checked).
- * @param addr Faulting user VA (any offset within the page).
+ * @param[in] t    Faulting thread (valid t->pgd).
+ * @param[in] v    VMA covering @addr (permission already checked).
+ * @param     addr Faulting user VA (any offset within the page).
  * @return 0 on success, -1 on OOM.
  * -------------------------------------------------------------------- */
 static int demand_page(struct thread *t, struct vma *v, unsigned long addr)
@@ -762,10 +763,10 @@ static int demand_page(struct thread *t, struct vma *v, unsigned long addr)
  * The refcount snapshot is race-free on a single hart: a count of 1
  * cannot concurrently grow, because only the sole owner itself could
  * fork the frame to a new sharer.
- * @param t    Faulting thread (valid t->pgd).
- * @param v    VMA covering @addr (write permission already checked).
- * @param pte  Leaf PTE slot for @addr (present, PTE_COW set).
- * @param addr Faulting user VA (any offset within the page).
+ * @param[in] t    Faulting thread (valid t->pgd).
+ * @param[in] v    VMA covering @addr (write permission already checked).
+ * @param[in] pte  Leaf PTE slot for @addr (present, PTE_COW set).
+ * @param     addr Faulting user VA (any offset within the page).
  * @return 0 (retry via sret); on OOM the process is killed instead.
  * -------------------------------------------------------------------- */
 static int do_cow_fault(struct thread *t, struct vma *v,
@@ -834,7 +835,7 @@ static int do_cow_fault(struct thread *t, struct vma *v,
  * SIE is re-enabled before any uart print (the IRQ-driven TX ring needs
  * interrupts; hardware cleared SIE on trap entry) and before the buddy
  * calls, matching the syscall path's convention.
- * @param tf Trap frame of the faulting context.
+ * @param[in] tf Trap frame of the faulting context.
  * @return 0 handled (retry via sret), -1 kernel bug (caller halts).
  * -------------------------------------------------------------------- */
 int do_page_fault(struct trap_frame *tf)
@@ -920,8 +921,8 @@ int do_page_fault(struct trap_frame *tf)
  * references on shared frames. A parent PTE left downgraded by a
  * failed fork self-heals on its next write: do_cow_fault() finds
  * refcount == 1 and upgrades it back in place.
- * @param ch  Child thread (empty vma_list, valid ch->pgd).
- * @param par Parent thread being forked.
+ * @param[out] ch  Child thread (empty vma_list, valid ch->pgd).
+ * @param[in]  par Parent thread being forked.
  * @return 0 on success, -1 on OOM.
  * -------------------------------------------------------------------- */
 int uvm_clone_vma(struct thread *ch, struct thread *par)

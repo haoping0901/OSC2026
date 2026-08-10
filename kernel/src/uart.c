@@ -274,7 +274,8 @@ void uart_top_half(unsigned int irq)
  * level work is consumed by uart_getc() in shell context; this BH
  * exists primarily as the unmask hook required by the spec, and as
  * the place to put any future heavier post-IRQ processing.
- * @param arg IRQ id (cast through uintptr_t) supplied by uart_top_half().
+ * @param[in] arg IRQ id (cast through uintptr_t) supplied by
+ *                uart_top_half().
  * -------------------------------------------------------------------- */
 void uart_bottom_half(void *arg)
 {

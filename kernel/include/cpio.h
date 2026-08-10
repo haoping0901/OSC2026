@@ -10,10 +10,10 @@ int cpio_cat(const void *archive, const char *filename);
  * Walks the archive until TRAILER!!! is reached, comparing each entry
  * name with @target. On match, returns the payload pointer and size via
  * the out-parameters; on failure, leaves them untouched.
- * @param archive Base of the cpio blob (as passed by the bootloader).
- * @param target  NUL-terminated filename to look up.
- * @param data    Out: pointer to the file payload inside the archive.
- * @param size    Out: payload size in bytes.
+ * @param[in]  archive Base of the cpio blob (as passed by the bootloader).
+ * @param[in]  target  NUL-terminated filename to look up.
+ * @param[out] data    Pointer to the file payload inside the archive.
+ * @param[out] size    Payload size in bytes.
  * @return 0 on success, -1 if not found or archive is invalid.
  * -------------------------------------------------------------------- */
 int cpio_find(const void *archive, const char *target,

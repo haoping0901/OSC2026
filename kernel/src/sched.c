@@ -58,8 +58,8 @@ static struct thread *dfs_find_pid(struct thread *root, int pid);
  * The kernel is built with -nostdlib so a tiny inline replacement for
  * memset(0) lives here. @bytes must be a multiple of sizeof(unsigned
  * long); all current callers pass a struct size that satisfies this.
- * @param p     Region base.
- * @param bytes Number of bytes to clear (multiple of word size).
+ * @param[out] p     Region base.
+ * @param      bytes Number of bytes to clear (multiple of word size).
  * -------------------------------------------------------------------- */
 static void zero_words(void *p, unsigned long bytes)
 {
@@ -166,7 +166,7 @@ struct thread *thread_alloc_bare(void)
  *
  * Bracketed by sie_save_clear/restore so a preempting timer IRQ cannot
  * observe a half-linked queue.
- * @param t Thread to enqueue.
+ * @param[in] t Thread to enqueue.
  * -------------------------------------------------------------------- */
 void thread_enqueue_ready(struct thread *t)
 {
@@ -198,7 +198,7 @@ void thread_block(void)
  *
  * Idempotent; a thread that is already READY/RUNNING is left alone,
  * and a ZOMBIE one is never resurrected.
- * @param t Thread to wake.
+ * @param[in] t Thread to wake.
  * -------------------------------------------------------------------- */
 void thread_wakeup(struct thread *t)
 {
@@ -218,7 +218,7 @@ void thread_wakeup(struct thread *t)
  * thread_free_user_vm()). Caller MUST already have:
  *   - detached @t from runq / parent->children;
  *   - set @t->state = THREAD_ZOMBIE.
- * @param t Thread to schedule for reaping.
+ * @param[in] t Thread to schedule for reaping.
  * -------------------------------------------------------------------- */
 void sched_zombify(struct thread *t)
 {
@@ -326,7 +326,7 @@ void thread_exit(void)
  * MUST be called only from a context where satp no longer points at
  * @t->pgd — i.e. the reap point (kill_zombies), or sys_exec() AFTER it
  * has switched satp to the new PGD.
- * @param t Thread whose address space is to be reclaimed.
+ * @param[in] t Thread whose address space is to be reclaimed.
  * -------------------------------------------------------------------- */
 void thread_free_user_vm(struct thread *t)
 {
@@ -430,9 +430,9 @@ void sched_init(void)
  *   sstatus = SPIE only (SPP = 0 → return to U; SPIE = 1 → SIE on)
  * All GPRs are zeroed; the returned address is wired into ctx.sp by
  * the caller.
- * @param t        Target thread (uses kstack_base/kstack_size).
- * @param entry    First instruction in U-mode.
- * @param user_sp  16-byte aligned user stack pointer.
+ * @param[in] t       Target thread (uses kstack_base/kstack_size).
+ * @param     entry   First instruction in U-mode.
+ * @param     user_sp 16-byte aligned user stack pointer.
  * @return Pointer to the planted trap_frame on @t's kernel stack.
  * -------------------------------------------------------------------- */
 static struct trap_frame *
@@ -467,17 +467,6 @@ plant_initial_frame(struct thread *t, uintptr_t entry, uintptr_t user_sp)
 }
 
 /** ----------------------------------------------------------------------
- * @brief thread_spawn_user() – Boot a user process from initrd.
- *
- * Looks up @path in the cpio archive, allocates a contiguous user
- * image+stack buffer, copies the program in, then constructs a thread
- * whose first switch_to() lands at user_thread_bootstrap and sret's
- * into U-mode at the program's entry. The new thread is linked as a
- * child of the caller (typically the shell / g_bootstrap).
- * @param path Filename inside the initial ramdisk.
- * @return New thread on success, NULL on lookup / OOM failure.
- * -------------------------------------------------------------------- */
-/** ----------------------------------------------------------------------
  * @brief round_up_page() – Round @n up to a PAGE_SIZE multiple.
  * @param n Byte count.
  * @return n rounded up to the next page boundary (n==0 -> 0).
@@ -496,10 +485,10 @@ static inline unsigned long round_up_page(unsigned long n)
  * handler can page its contents in on demand; stack and sigpage are
  * anonymous. All-or-nothing: if any vma_alloc() fails, the already-
  * allocated nodes are kfree'd and the list is left untouched.
- * @param t         Thread to register into (vma_list already INIT'd).
- * @param file_src  Program bytes inside the initrd (kernel VA).
- * @param file_len  Program length in bytes.
- * @param img_bytes Image region length (page-rounded @file_len).
+ * @param[in] t         Thread to register into (vma_list already INIT'd).
+ * @param[in] file_src  Program bytes inside the initrd (kernel VA).
+ * @param     file_len  Program length in bytes.
+ * @param     img_bytes Image region length (page-rounded @file_len).
  * @return 0 on success, -1 on OOM (nothing linked).
  * -------------------------------------------------------------------- */
 static int vma_register_fixed(struct thread *t, const void *file_src,
@@ -541,9 +530,9 @@ static int vma_register_fixed(struct thread *t, const void *file_src,
  * sigreturn trampoline through t->sigpage_base (kernel VA), so its
  * frame must exist before any dispatch. Its ownership still lies with
  * the page table; sigpage_base is only a cached alias.
- * @param t   Thread with a valid @t->pgd (from pgd_alloc()).
- * @param src Program bytes inside the initrd (kernel VA).
- * @param sz  Program length in bytes.
+ * @param[in] t   Thread with a valid @t->pgd (from pgd_alloc()).
+ * @param[in] src Program bytes inside the initrd (kernel VA).
+ * @param     sz  Program length in bytes.
  * @return 0 on success, -1 on OOM.
  * -------------------------------------------------------------------- */
 int uvm_setup_image(struct thread *t, const void *src, unsigned long sz)
@@ -595,7 +584,7 @@ int uvm_setup_image(struct thread *t, const void *src, unsigned long sz)
  * the stack below USER_STACK_TOP, then constructs a thread whose first
  * switch_to() lands at user_thread_bootstrap and sret's into U-mode at
  * VA 0. The new thread is linked as a child of the caller.
- * @param path Filename inside the initial ramdisk.
+ * @param[in] path Filename inside the initial ramdisk.
  * @return New thread on success, NULL on lookup / OOM failure.
  * -------------------------------------------------------------------- */
 struct thread *thread_spawn_user(const char *path)
@@ -653,8 +642,8 @@ fail_thread:
  * Walks @root and its descendants looking for a thread whose pid
  * matches. Used by find_thread_by_pid(); kept private because the
  * recursion is bounded by the process tree depth (lab scope: tiny).
- * @param root Subtree root to start from.
- * @param pid  Process id to look for.
+ * @param[in] root Subtree root to start from.
+ * @param     pid  Process id to look for.
  * @return Matching thread or NULL.
  * -------------------------------------------------------------------- */
 static struct thread *dfs_find_pid(struct thread *root, int pid)

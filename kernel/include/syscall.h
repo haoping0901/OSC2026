@@ -31,7 +31,7 @@
  * instruction. Reads the call number from tf->a7 and forwards the
  * arguments in tf->a0..a2 to the corresponding handler. The returned
  * value is written into tf->a0 by the caller.
- * @param tf Trap frame on the kernel stack.
+ * @param[in,out] tf Trap frame on the kernel stack.
  * @return Value the syscall returned to user space (placed in a0).
  * -------------------------------------------------------------------- */
 long do_syscall(struct trap_frame *tf);

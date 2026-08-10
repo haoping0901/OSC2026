@@ -30,6 +30,7 @@ struct tmpfs_node {
     char name[TMPFS_MAX_NAME + 1];
     enum tmpfs_type type;
     struct vnode *vnode;
+    struct tmpfs_node *parent;
     struct tmpfs_node *entries[TMPFS_MAX_ENTRIES];
     int entry_count;
     char *data;
@@ -46,6 +47,8 @@ static int tmpfs_lookup(struct vnode *dir_node, struct vnode **target,
                         const char *component_name);
 static int tmpfs_create(struct vnode *dir_node, struct vnode **target,
                         const char *component_name);
+static int tmpfs_mkdir(struct vnode *dir_node, struct vnode **target,
+                       const char *component_name);
 static int tmpfs_open(struct vnode *file_node, struct file **target);
 static int tmpfs_close(struct file *file);
 static int tmpfs_read(struct file *file, void *buf, size_t len);
@@ -57,7 +60,7 @@ static long tmpfs_lseek64(struct file *file, long offset, int whence);
  *
  * Stops counting once the tmpfs limit is exceeded so an overlong name
  * cannot drive an unbounded scan.
- * @param name Component name to measure.
+ * @param[in] name Component name to measure.
  * @return Length in bytes, or TMPFS_MAX_NAME + 1 when it is too long.
  * -------------------------------------------------------------------- */
 static size_t tmpfs_name_len(const char *name)
@@ -77,9 +80,9 @@ static size_t tmpfs_name_len(const char *name)
  * Both objects are created together because a tmpfs node is only ever
  * reachable through its vnode; allocating them separately would leave a
  * window where one exists without the other.
- * @param name  Component name to store; must already fit the limit.
- * @param type  Whether the node is a regular file or a directory.
- * @param mount Mount the new vnode belongs to.
+ * @param[in] name  Component name to store; must already fit the limit.
+ * @param     type  Whether the node is a regular file or a directory.
+ * @param[in] mount Mount the new vnode belongs to.
  * @return The new node, or NULL when out of memory.
  * -------------------------------------------------------------------- */
 static struct tmpfs_node *tmpfs_new_node(const char *name,
@@ -111,10 +114,23 @@ static struct tmpfs_node *tmpfs_new_node(const char *name,
     node->data = NULL;
     node->size = 0;
 
+    /* A root directory has no parent inside its own file system, so it
+     * points at itself: ".." from the root then stays at the root
+     * without the caller needing a special case. The real parent is
+     * filled in by tmpfs_add_entry() for every other node. */
+    node->parent = node;
+
     vnode->mount = mount;
     vnode->v_ops = &g_tmpfs_v_ops;
     vnode->f_ops = &g_tmpfs_f_ops;
     vnode->internal = node;
+    vnode->type = (type == TMPFS_TYPE_DIR) ? VNODE_TYPE_DIR
+                                           : VNODE_TYPE_FILE;
+
+    /* kmalloc() hands back uninitialised memory: leaving this stale
+     * would make the traversal mistake a fresh vnode for a mount point
+     * and follow a garbage pointer. */
+    vnode->mounted = NULL;
 
     node->vnode = vnode;
     return node;
@@ -125,9 +141,9 @@ static struct tmpfs_node *tmpfs_new_node(const char *name,
  *
  * A miss is normal control flow — vfs_open() relies on it to decide
  * whether O_CREAT should create the file — so nothing is printed here.
- * @param dir_node       Directory to search.
- * @param target         Out: vnode of the matching entry.
- * @param component_name Name to match exactly.
+ * @param[in]  dir_node       Directory to search.
+ * @param[out] target         Vnode of the matching entry.
+ * @param[in]  component_name Name to match exactly.
  * @return 0 when found, -1 when absent or @dir_node is not a directory.
  * -------------------------------------------------------------------- */
 static int tmpfs_lookup(struct vnode *dir_node, struct vnode **target,
@@ -150,18 +166,26 @@ static int tmpfs_lookup(struct vnode *dir_node, struct vnode **target,
 }    /* tmpfs_lookup */
 
 /** ----------------------------------------------------------------------
- * @brief tmpfs_create() – Add a regular file to @dir_node.
+ * @brief tmpfs_add_entry() – Add an entry of @type to @dir_node.
  *
- * Rejects a duplicate name so an existing file is never silently
+ * Creating a directory differs from creating a regular file only in the
+ * node type, so both go through one body: the name, capacity, and
+ * duplicate checks stay identical instead of drifting apart in two
+ * near-copies.
+ *
+ * Rejects a duplicate name so an existing entry is never silently
  * replaced along with its contents.
- * @param dir_node       Directory that will own the new file.
- * @param target         Out: vnode of the created file.
- * @param component_name Name for the new entry.
+ * @param[in]  dir_node       Directory that will own the new entry.
+ * @param[out] target         Vnode of the created entry.
+ * @param[in]  component_name Name for the new entry.
+ * @param      type           Whether to create a regular file or a
+ *                            directory.
  * @return 0 on success, -1 when the name is too long, already taken,
  *         the directory is full, or memory ran out.
  * -------------------------------------------------------------------- */
-static int tmpfs_create(struct vnode *dir_node, struct vnode **target,
-                        const char *component_name)
+static int tmpfs_add_entry(struct vnode *dir_node, struct vnode **target,
+                           const char *component_name,
+                           enum tmpfs_type type)
 {
     if (!dir_node || !target || !component_name)
         return -1;
@@ -181,23 +205,53 @@ static int tmpfs_create(struct vnode *dir_node, struct vnode **target,
     if (tmpfs_lookup(dir_node, &existing, component_name) == 0)
         return -1;
 
-    struct tmpfs_node *node = tmpfs_new_node(component_name,
-                                             TMPFS_TYPE_FILE,
+    struct tmpfs_node *node = tmpfs_new_node(component_name, type,
                                              dir_node->mount);
     if (!node)
         return -1;
 
+    node->parent = dir;
     dir->entries[dir->entry_count++] = node;
     *target = node->vnode;
     return 0;
+}    /* tmpfs_add_entry */
+
+/** ----------------------------------------------------------------------
+ * @brief tmpfs_create() – Add a regular file to @dir_node.
+ *
+ * @param[in]  dir_node       Directory that will own the new file.
+ * @param[out] target         Vnode of the created file.
+ * @param[in]  component_name Name for the new entry.
+ * @return 0 on success, -1 otherwise.
+ * -------------------------------------------------------------------- */
+static int tmpfs_create(struct vnode *dir_node, struct vnode **target,
+                        const char *component_name)
+{
+    return tmpfs_add_entry(dir_node, target, component_name,
+                           TMPFS_TYPE_FILE);
 }    /* tmpfs_create */
+
+/** ----------------------------------------------------------------------
+ * @brief tmpfs_mkdir() – Add a subdirectory to @dir_node.
+ *
+ * @param[in]  dir_node       Directory that will own the new subdirectory.
+ * @param[out] target         Vnode of the created directory.
+ * @param[in]  component_name Name for the new entry.
+ * @return 0 on success, -1 otherwise.
+ * -------------------------------------------------------------------- */
+static int tmpfs_mkdir(struct vnode *dir_node, struct vnode **target,
+                       const char *component_name)
+{
+    return tmpfs_add_entry(dir_node, target, component_name,
+                           TMPFS_TYPE_DIR);
+}    /* tmpfs_mkdir */
 
 /** ----------------------------------------------------------------------
  * @brief tmpfs_open() – Allocate a handle for @file_node.
  *
  * Only binds the vnode; the generic layer initialises f_pos and flags.
- * @param file_node Vnode being opened.
- * @param target    Out: freshly allocated handle.
+ * @param[in]  file_node Vnode being opened.
+ * @param[out] target    Freshly allocated handle.
  * @return 0 on success, -1 on bad argument or allocation failure.
  * -------------------------------------------------------------------- */
 static int tmpfs_open(struct vnode *file_node, struct file **target)
@@ -223,7 +277,7 @@ static int tmpfs_open(struct vnode *file_node, struct file **target)
  *
  * The vnode and its contents survive: they stay linked into the parent
  * directory and must outlive any single handle.
- * @param file Handle to release.
+ * @param[in] file Handle to release.
  * @return 0 on success, -1 on bad argument.
  * -------------------------------------------------------------------- */
 static int tmpfs_close(struct file *file)
@@ -242,9 +296,9 @@ static int tmpfs_close(struct file *file)
  * nothing beyond its node. A write reaching the size cap is truncated
  * rather than refused, matching the short-write semantics the caller
  * detects through the return value.
- * @param file Handle to write through.
- * @param buf  Source bytes.
- * @param len  Number of bytes requested.
+ * @param[in] file Handle to write through.
+ * @param[in] buf  Source bytes.
+ * @param     len  Number of bytes requested.
  * @return Bytes actually written, or -1 when the target is not a file
  *         or the buffer could not be allocated.
  * -------------------------------------------------------------------- */
@@ -290,9 +344,9 @@ static int tmpfs_write(struct file *file, const void *buf, size_t len)
  *
  * Clamps to the stored size, so a read starting at or past end-of-file
  * returns 0 instead of exposing untouched buffer bytes.
- * @param file Handle to read from.
- * @param buf  Destination buffer of at least @len bytes.
- * @param len  Number of bytes requested.
+ * @param[in]  file Handle to read from.
+ * @param[out] buf  Destination buffer of at least @len bytes.
+ * @param      len  Number of bytes requested.
  * @return Bytes actually read, 0 at EOF, or -1 when the target is not a
  *         regular file.
  * -------------------------------------------------------------------- */
@@ -323,9 +377,9 @@ static int tmpfs_read(struct file *file, void *buf, size_t len)
  *
  * Only SEEK_SET is supported so far, which covers rewinding a handle
  * between a write and a read.
- * @param file   Handle to reposition.
- * @param offset New absolute offset when @whence is SEEK_SET.
- * @param whence Reference point for @offset.
+ * @param[in] file   Handle to reposition.
+ * @param     offset New absolute offset when @whence is SEEK_SET.
+ * @param     whence Reference point for @offset.
  * @return The new offset, or -1 on an unsupported or out-of-range seek.
  * -------------------------------------------------------------------- */
 static long tmpfs_lseek64(struct file *file, long offset, int whence)
@@ -344,8 +398,8 @@ static long tmpfs_lseek64(struct file *file, long offset, int whence)
  *
  * Called once per mount; the root vnode points back at @mount so a
  * later traversal can tell which mount a vnode belongs to.
- * @param fs    File system being mounted.
- * @param mount Mount to populate.
+ * @param[in]  fs    File system being mounted.
+ * @param[out] mount Mount to populate.
  * @return 0 on success, -1 on bad argument or allocation failure.
  * -------------------------------------------------------------------- */
 static int tmpfs_setup_mount(struct filesystem *fs, struct mount *mount)
@@ -365,7 +419,7 @@ static int tmpfs_setup_mount(struct filesystem *fs, struct mount *mount)
 static struct vnode_operations g_tmpfs_v_ops = {
     .lookup = tmpfs_lookup,
     .create = tmpfs_create,
-    .mkdir  = NULL,
+    .mkdir  = tmpfs_mkdir,
 };
 
 static struct file_operations g_tmpfs_f_ops = {
