@@ -15,11 +15,18 @@
  * hangs its own bookkeeping off vnode->internal.
  */
 
-/* Longest absolute path the resolver accepts, NUL excluded. */
+/* Longest path the resolver accepts, NUL excluded. */
 #define VFS_MAX_PATHNAME    255
 
 /* Registered file-system slots. Grown only when a new fs is added. */
 #define VFS_MAX_FS          8
+
+/*
+ * Per-process file-descriptor table size. The spec fixes the ceiling at
+ * 16, and a descriptor is an index into that table, so a valid fd always
+ * satisfies 0 <= fd < VFS_MAX_FD.
+ */
+#define VFS_MAX_FD          16
 
 /*
  * open() flags. The value matches the conventional POSIX bit so a
@@ -66,11 +73,21 @@ struct vnode {
     struct mount *mounted;
 };
 
+/*
+ * An open file description.
+ *
+ * fork() hands the child the same struct file rather than a copy, which
+ * is what makes parent and child share one f_pos the way POSIX requires.
+ * ref_count tracks how many descriptor slots point here so the last
+ * close releases the handle and the earlier ones do not free a struct
+ * the other side is still reading through.
+ */
 struct file {
     struct vnode *vnode;
     size_t f_pos;
     struct file_operations *f_ops;
     int flags;
+    int ref_count;
 };
 
 struct mount {
@@ -120,18 +137,35 @@ int register_filesystem(struct filesystem *fs);
 /** ----------------------------------------------------------------------
  * @brief vfs_open() – Open @pathname, optionally creating the file.
  *
- * Resolves @pathname to its parent directory, asks that directory to
- * look the final component up, and creates the file through the parent
- * when it is missing and O_CREAT is set. The generic layer owns f_pos
- * and flags in the returned handle; the file system only allocates the
- * struct file and binds its vnode.
+ * The root-relative form of vfs_open_at(), kept so kernel-internal
+ * callers that only ever pass absolute paths need not thread a starting
+ * directory through.
  * @param[in]  pathname Absolute path beginning with '/'.
  * @param      flags    O_CREAT to create the file when it does not exist.
  * @param[out] target   Handle for the opened file.
- * @return 0 on success, -1 on bad path, missing file, or allocation
- *         failure.
+ * @return 0 on success, a negative error code on failure.
  * -------------------------------------------------------------------- */
 int vfs_open(const char *pathname, int flags, struct file **target);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_open_at() – Open @pathname relative to @start.
+ *
+ * Resolves @pathname to its parent directory, asks that directory to
+ * look the final component up, and creates the file through the parent
+ * when it is missing and O_CREAT is set. The generic layer owns f_pos,
+ * flags and ref_count in the returned handle; the file system only
+ * allocates the struct file and binds its vnode.
+ * @param[in]  start    Directory a relative @pathname resolves from,
+ *                      which is how each task resolves against its own
+ *                      cwd; NULL means the root file system. An absolute
+ *                      @pathname ignores @start either way.
+ * @param[in]  pathname Absolute or relative path.
+ * @param      flags    O_CREAT to create the file when it does not exist.
+ * @param[out] target   Handle for the opened file.
+ * @return 0 on success, a negative error code on failure.
+ * -------------------------------------------------------------------- */
+int vfs_open_at(struct vnode *start, const char *pathname, int flags,
+                struct file **target);
 
 /** ----------------------------------------------------------------------
  * @brief vfs_close() – Release an opened file handle.
@@ -142,6 +176,16 @@ int vfs_open(const char *pathname, int flags, struct file **target);
  * @return 0 on success, -1 on bad argument.
  * -------------------------------------------------------------------- */
 int vfs_close(struct file *file);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_file_get() – Claim one more reference to @file.
+ *
+ * Called when a second descriptor slot starts pointing at an existing
+ * open file description, which is what fork() does to every inherited
+ * slot. The matching release is vfs_close().
+ * @param[in,out] file Handle gaining a reference.
+ * -------------------------------------------------------------------- */
+void vfs_file_get(struct file *file);
 
 /** ----------------------------------------------------------------------
  * @brief vfs_write() – Write @len bytes from @buf at the file position.
@@ -173,11 +217,29 @@ int vfs_read(struct file *file, void *buf, size_t len);
  * directory to create the leaf. A file system that offers no mkdir
  * operation refuses the call, which is how a read-only fs stays
  * read-only without the generic layer knowing about it.
+ *
+ * The root-relative form of vfs_mkdir_at(), kept so kernel-internal
+ * callers that only ever pass absolute paths need not thread a starting
+ * directory through.
  * @param[in] pathname Absolute path of the directory to create.
- * @return 0 on success, -1 on a bad path, a missing parent, a name that
- *         is already taken, or a fs that cannot create directories.
+ * @return 0 on success, a negative error code on a bad path, a missing
+ *         parent, a name already taken, or a fs that cannot create
+ *         directories.
  * -------------------------------------------------------------------- */
 int vfs_mkdir(const char *pathname);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_mkdir_at() – Create the directory @pathname names.
+ *
+ * The @start-relative form of vfs_mkdir().
+ * @param[in] start    Directory a relative @pathname resolves from,
+ *                     which is how each task resolves against its own
+ *                     cwd; NULL means the root file system. An absolute
+ *                     @pathname ignores @start either way.
+ * @param[in] pathname Absolute or relative path of the new directory.
+ * @return 0 on success, a negative error code on failure.
+ * -------------------------------------------------------------------- */
+int vfs_mkdir_at(struct vnode *start, const char *pathname);
 
 /** ----------------------------------------------------------------------
  * @brief vfs_mount() – Mount @filesystem onto the directory @target.
@@ -189,13 +251,33 @@ int vfs_mkdir(const char *pathname);
  * Only a directory may be covered. Mounting onto a regular file would
  * produce a vnode nothing can be looked up inside, so it is rejected
  * rather than left to fail confusingly on the next traversal.
+ *
+ * The root-relative form of vfs_mount_at(), kept so kernel-internal
+ * callers that only ever pass absolute paths need not thread a starting
+ * directory through.
  * @param[in] target     Absolute path of an existing directory that is not
  *                       already a mount point.
  * @param[in] filesystem Registered file-system name.
- * @return 0 on success, -1 on a bad path, a non-directory or already
- *         covered target, an unknown fs, or allocation failure.
+ * @return 0 on success, a negative error code on a bad path, a
+ *         non-directory or already covered target, an unknown fs, or
+ *         allocation failure.
  * -------------------------------------------------------------------- */
 int vfs_mount(const char *target, const char *filesystem);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_mount_at() – Mount @filesystem onto the directory @target.
+ *
+ * The @start-relative form of vfs_mount().
+ * @param[in] start      Directory a relative @target resolves from,
+ *                       which is how each task resolves against its own
+ *                       cwd; NULL means the root file system. An absolute
+ *                       @target ignores @start either way.
+ * @param[in] target     Absolute or relative path of the mount point.
+ * @param[in] filesystem Registered file-system name.
+ * @return 0 on success, a negative error code on failure.
+ * -------------------------------------------------------------------- */
+int vfs_mount_at(struct vnode *start, const char *target,
+                 const char *filesystem);
 
 /** ----------------------------------------------------------------------
  * @brief vfs_lookup() – Resolve @pathname to its vnode.
@@ -203,12 +285,52 @@ int vfs_mount(const char *target, const char *filesystem);
  * Walks from the root file system's root and crosses every mount point
  * on the way, so the vnode returned belongs to the file system actually
  * mounted at @pathname. "/" resolves to the root itself.
+ *
+ * The root-relative form of vfs_lookup_at(), kept so kernel-internal
+ * callers that only ever pass absolute paths need not thread a starting
+ * directory through.
  * @param[in]  pathname Absolute path to resolve.
  * @param[out] target   Vnode the path names.
- * @return 0 on success, -1 on a bad path or a component that does not
- *         exist.
+ * @return 0 on success, a negative error code on a bad path or a
+ *         component that does not exist.
  * -------------------------------------------------------------------- */
 int vfs_lookup(const char *pathname, struct vnode **target);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_lookup_at() – Resolve @pathname starting from @start.
+ *
+ * The @start-relative form of vfs_lookup(). An empty @pathname names
+ * @start itself, so "" resolves to the starting directory rather than
+ * failing.
+ * @param[in]  start    Directory a relative @pathname resolves from,
+ *                      which is how each task resolves against its own
+ *                      cwd; NULL means the root file system. An absolute
+ *                      @pathname ignores @start either way.
+ * @param[in]  pathname Absolute or relative path to resolve.
+ * @param[out] target   Vnode the path names.
+ * @return 0 on success, a negative error code on failure.
+ * -------------------------------------------------------------------- */
+int vfs_lookup_at(struct vnode *start, const char *pathname,
+                  struct vnode **target);
+
+/** ----------------------------------------------------------------------
+ * @brief vfs_chdir() – Resolve @pathname to the directory it names.
+ *
+ * Resolves the path and refuses anything that is not a directory, so a
+ * caller can assign the result to its cwd without re-checking. Does not
+ * touch any task state itself: the VFS has no notion of "current task",
+ * so the caller installs the returned vnode.
+ * @param[in]  start    Directory a relative @pathname resolves from,
+ *                      which is how each task resolves against its own
+ *                      cwd; NULL means the root file system. An absolute
+ *                      @pathname ignores @start either way.
+ * @param[in]  pathname Absolute or relative path of the new directory.
+ * @param[out] target   Vnode of the resolved directory.
+ * @return 0 on success, a negative error code when the path does not
+ *         resolve or does not name a directory.
+ * -------------------------------------------------------------------- */
+int vfs_chdir(struct vnode *start, const char *pathname,
+              struct vnode **target);
 
 /** ----------------------------------------------------------------------
  * @brief vfs_init() – Register tmpfs and mount it as the root fs.

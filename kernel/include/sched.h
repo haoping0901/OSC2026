@@ -4,6 +4,7 @@
 #include "list.h"
 #include "types.h"
 #include "signal.h"
+#include "vfs.h"
 
 /*
  * Cooperative kernel-thread scheduler extended with user-process
@@ -114,6 +115,29 @@ struct thread {
      * mmap regions never collide with the fixed image (low) / stack (high).
      */
     unsigned long mmap_top;
+
+    /* ---------------- Per-task file system state ---------------------- */
+
+    /*
+     * Directory a relative pathname resolves from. Private per task, so
+     * one process's chdir() never moves another's. NULL until the root
+     * file system exists (see vfs_init()) or for a kernel-only thread;
+     * vfs_walk() then falls back to the root, which keeps an absolute
+     * path resolvable from any context.
+     */
+    struct vnode *cwd;
+
+    /*
+     * Open files, indexed by descriptor: slot i IS fd i, and a NULL slot
+     * is free, so allocation is a scan for the first hole and a closed
+     * descriptor is reusable without any extra bookkeeping.
+     *
+     * fork() copies these POINTERS rather than the handles, so parent and
+     * child share one f_pos per inherited descriptor the way POSIX
+     * requires; struct file::ref_count is what keeps the handle alive
+     * until the last of them closes it.
+     */
+    struct file *fd_table[VFS_MAX_FD];
 };
 
 /* User stack size attached after every user image. */

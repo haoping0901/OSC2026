@@ -88,7 +88,15 @@ rootfs/osctest.bin: osctest.bin
 	mkdir -p rootfs
 	cp osctest.bin rootfs/osctest.bin
 
-initramfs.cpio: rootfs/hello.txt rootfs/prog.bin rootfs/osctest.bin
+# Lab7 Basic Ex3 acceptance test supplied by the course, from
+# https://github.com/nycu-caslab/OSC2026/raw/main/uploads/lab7/vfs.bin
+# This is the binary the spec designates for the demo: exec vfs.bin
+rootfs/vfs.bin: vfs.bin
+	mkdir -p rootfs
+	cp vfs.bin rootfs/vfs.bin
+
+initramfs.cpio: rootfs/hello.txt rootfs/prog.bin rootfs/osctest.bin \
+                rootfs/vfs.bin
 	cd rootfs && find . | cpio -o -H newc > ../initramfs.cpio
 
 test: qemu initramfs.cpio

@@ -14,6 +14,8 @@
 #include "timer.h"
 #include "signal.h"
 #include "mm.h"
+#include "vfs.h"
+#include "errno.h"
 
 /*
  * System-call layer.
@@ -62,6 +64,93 @@ static int in_user_range(const void *p, unsigned long n)
             return 1;
     }
     return 0;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief copy_path_from_user() – Copy a NUL-terminated user path in.
+ *
+ * A path arrives as a bare pointer with no length, so its extent cannot
+ * be validated up front the way a sized buffer can. Each byte is
+ * therefore range-checked immediately before it is read, and the copy
+ * stops at the buffer limit: the kernel never dereferences past what
+ * the caller actually has mapped, and an unterminated string cannot
+ * drive an unbounded scan.
+ * @param[in]  upath User pointer to the path.
+ * @param[out] kbuf  Kernel buffer receiving the NUL-terminated copy.
+ * @param      sz    Size of @kbuf in bytes, NUL included.
+ * @return 0 on success, -EFAULT when @upath leaves mapped memory,
+ *         -ENAMETOOLONG when the path does not fit @kbuf.
+ * -------------------------------------------------------------------- */
+static int copy_path_from_user(const char *upath, char *kbuf, size_t sz)
+{
+    if (!upath || !kbuf || sz == 0)
+        return -EFAULT;
+
+    for (size_t i = 0; i < sz; i++) {
+        if (!in_user_range(upath + i, 1))
+            return -EFAULT;
+        kbuf[i] = upath[i];
+        if (kbuf[i] == '\0')
+            return 0;
+    }
+    return -ENAMETOOLONG;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief fd_alloc() – Bind @file to the lowest free descriptor of @t.
+ *
+ * Scanning from 0 hands back the smallest available number, which is
+ * both the POSIX rule and what makes a descriptor reusable as soon as
+ * it is closed.
+ * @param[in,out] t    Task whose table gains the entry.
+ * @param[in]     file Open file description to install.
+ * @return The new descriptor, or -EMFILE when the table is full.
+ * -------------------------------------------------------------------- */
+static int fd_alloc(struct thread *t, struct file *file)
+{
+    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
+        if (!t->fd_table[fd]) {
+            t->fd_table[fd] = file;
+            return fd;
+        }
+    }
+    return -EMFILE;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief fd_get() – Translate a user-supplied descriptor to its handle.
+ *
+ * The only place a descriptor from user space is trusted, so every
+ * syscall taking an fd goes through here: an out-of-range number and a
+ * number naming a closed slot both fail rather than indexing the table.
+ * @param[in] t  Task owning the descriptor.
+ * @param     fd Descriptor as passed by user space.
+ * @return The open file description, or NULL when @fd names none.
+ * -------------------------------------------------------------------- */
+static struct file *fd_get(struct thread *t, int fd)
+{
+    if (fd < 0 || fd >= VFS_MAX_FD)
+        return NULL;
+    return t->fd_table[fd];
+}
+
+/** ----------------------------------------------------------------------
+ * @brief fd_table_close_all() – Release every descriptor held by @t.
+ *
+ * Called on process exit. Each slot is cleared before vfs_close() drops
+ * its reference, so a handle shared with a forked relative is released
+ * exactly once from this side.
+ * @param[in,out] t Task being torn down.
+ * -------------------------------------------------------------------- */
+static void fd_table_close_all(struct thread *t)
+{
+    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
+        struct file *f = t->fd_table[fd];
+        if (!f)
+            continue;
+        t->fd_table[fd] = NULL;
+        vfs_close(f);
+    }
 }
 
 /** ----------------------------------------------------------------------
@@ -295,6 +384,28 @@ static long sys_fork(struct trap_frame *tf)
     ch->sig.pending       = 0;
     ch->sig.in_handler    = 0;
 
+    /* 5b) Inherit the file system context. The cwd is a shared vnode
+     *     (both tasks may sit in the same directory; each may chdir away
+     *     independently). Descriptors are inherited as POSIX specifies:
+     *     the child gets the same open file descriptions, NOT copies, so
+     *     the two sides share one f_pos per descriptor. Each inherited
+     *     slot takes its own reference, which is what lets both tasks
+     *     close independently without the first release freeing a handle
+     *     the other still holds.
+     *
+     *     thread_alloc_bare() already copied the creator's cwd, but the
+     *     creator is the forking parent only because fork runs in its
+     *     context; assigning explicitly keeps that from being load
+     *     bearing. */
+    ch->cwd = par->cwd;
+    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
+        struct file *f = par->fd_table[fd];
+        if (!f)
+            continue;
+        vfs_file_get(f);
+        ch->fd_table[fd] = f;
+    }
+
     /* 6) Parent linkage + enqueue. */
     ch->parent = par;
     unsigned long flags = sie_save_clear();
@@ -378,6 +489,14 @@ void do_exit(long status)
 {
     struct thread *self = get_current();
 
+    /*
+     * Release the open files before the thread stops being scheduled.
+     * This runs with interrupts on and in the dying task's own context,
+     * which the reaper cannot offer: it frees the kstack from the idle
+     * thread, where get_current() is no longer this task.
+     */
+    fd_table_close_all(self);
+
     unsigned long flags = sie_save_clear();
     self->exit_status = (int)status;
 
@@ -449,7 +568,11 @@ static long sys_stop(long pid)
     sie_restore(flags);
 
     /* The victim's user VM is reclaimed by the reaper; freeing it here
-     * is unsafe (it may still be the live satp of a preempted run). */
+     * is unsafe (it may still be the live satp of a preempted run). Its
+     * open files are not part of the address space, so they are released
+     * here — the victim never runs again and so never reaches do_exit()
+     * to release them itself. */
+    fd_table_close_all(t);
     signal_release(t);
     if (par)
         thread_wakeup(par);
@@ -598,9 +721,191 @@ static long sys_mmap(void *addr, unsigned long length, int prot, int flags)
 }
 
 /** ----------------------------------------------------------------------
+ * @brief sys_open() – Open @pathname and return a descriptor for it.
+ *
+ * Resolves @pathname against the caller's cwd when it is relative, then
+ * publishes the handle in the caller's table. A table that is already
+ * full is detected only after the open succeeded, so the handle is
+ * closed again rather than leaked.
+ * @param[in] pathname User pointer to the path to open.
+ * @param     flags    O_CREAT to create the file when it is missing.
+ * @return A non-negative descriptor, or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_open(const char *pathname, int flags)
+{
+    struct thread *self = get_current();
+    char path[VFS_MAX_PATHNAME + 1];
+
+    int ret = copy_path_from_user(pathname, path, sizeof(path));
+    if (ret != 0)
+        return ret;
+
+    struct file *file = NULL;
+    ret = vfs_open_at(self->cwd, path, flags, &file);
+    if (ret != 0)
+        return ret;
+
+    int fd = fd_alloc(self, file);
+    if (fd < 0) {
+        vfs_close(file);
+        return fd;
+    }
+    return fd;
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_close() – Release descriptor @fd.
+ *
+ * Clears the slot first so the descriptor is reusable even if the file
+ * system reports a failure while releasing the handle.
+ * @param fd Descriptor to close.
+ * @return 0 on success, -EBADF when @fd names no open file.
+ * -------------------------------------------------------------------- */
+static long sys_close(int fd)
+{
+    struct thread *self = get_current();
+    struct file *file = fd_get(self, fd);
+
+    if (!file)
+        return -EBADF;
+
+    self->fd_table[fd] = NULL;
+    return vfs_close(file);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_read() – Read up to @count bytes from @fd into @buf.
+ * @param     fd    Descriptor to read from.
+ * @param[out] buf  User destination buffer.
+ * @param     count Maximum number of bytes to read.
+ * @return Bytes read (0 at EOF), or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_read(int fd, void *buf, unsigned long count)
+{
+    struct thread *self = get_current();
+    struct file *file = fd_get(self, fd);
+
+    if (!file)
+        return -EBADF;
+    if (count == 0)
+        return 0;
+    if (!in_user_range(buf, count))
+        return -EFAULT;
+
+    return vfs_read(file, buf, (size_t)count);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_write() – Write up to @count bytes from @buf to @fd.
+ * @param    fd    Descriptor to write to.
+ * @param[in] buf  User source buffer.
+ * @param    count Number of bytes to write.
+ * @return Bytes written, or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_write(int fd, const void *buf, unsigned long count)
+{
+    struct thread *self = get_current();
+    struct file *file = fd_get(self, fd);
+
+    if (!file)
+        return -EBADF;
+    if (count == 0)
+        return 0;
+    if (!in_user_range(buf, count))
+        return -EFAULT;
+
+    return vfs_write(file, buf, (size_t)count);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_mkdir() – Create the directory named by @pathname.
+ *
+ * @mode is accepted for signature compatibility and ignored: this
+ * kernel has no access control for it to describe.
+ * @param[in] pathname User pointer to the path of the new directory.
+ * @param     mode     Permission bits; ignored.
+ * @return 0 on success, or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_mkdir(const char *pathname, unsigned int mode)
+{
+    (void)mode;
+
+    struct thread *self = get_current();
+    char path[VFS_MAX_PATHNAME + 1];
+
+    int ret = copy_path_from_user(pathname, path, sizeof(path));
+    if (ret != 0)
+        return ret;
+
+    return vfs_mkdir_at(self->cwd, path);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_mount() – Mount @filesystem onto the directory @target.
+ *
+ * @src, @flags and @data are accepted for signature compatibility and
+ * ignored: the only file system here is memory backed, so it has no
+ * device to name and no options to parse.
+ * @param[in] src        Source device; ignored.
+ * @param[in] target     User pointer to the mount-point path.
+ * @param[in] filesystem User pointer to the registered fs name.
+ * @param     flags      Mount flags; ignored.
+ * @param[in] data       File-system private options; ignored.
+ * @return 0 on success, or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_mount(const char *src, const char *target,
+                      const char *filesystem, unsigned long flags,
+                      const void *data)
+{
+    (void)src;
+    (void)flags;
+    (void)data;
+
+    struct thread *self = get_current();
+    char target_path[VFS_MAX_PATHNAME + 1];
+    char fs_name[VFS_MAX_PATHNAME + 1];
+
+    int ret = copy_path_from_user(target, target_path, sizeof(target_path));
+    if (ret != 0)
+        return ret;
+
+    ret = copy_path_from_user(filesystem, fs_name, sizeof(fs_name));
+    if (ret != 0)
+        return ret;
+
+    return vfs_mount_at(self->cwd, target_path, fs_name);
+}
+
+/** ----------------------------------------------------------------------
+ * @brief sys_chdir() – Move the caller's working directory to @path.
+ *
+ * Only the calling task is affected: cwd lives in struct thread, so a
+ * child that chdir()s never drags its parent along.
+ * @param[in] path User pointer to the path of the new directory.
+ * @return 0 on success, or a negated errno on failure.
+ * -------------------------------------------------------------------- */
+static long sys_chdir(const char *path)
+{
+    struct thread *self = get_current();
+    char kpath[VFS_MAX_PATHNAME + 1];
+
+    int ret = copy_path_from_user(path, kpath, sizeof(kpath));
+    if (ret != 0)
+        return ret;
+
+    struct vnode *dir = NULL;
+    ret = vfs_chdir(self->cwd, kpath, &dir);
+    if (ret != 0)
+        return ret;
+
+    self->cwd = dir;
+    return 0;
+}
+
+/** ----------------------------------------------------------------------
  * @brief do_syscall() – Decode tf->a7 and dispatch to the handler.
  *
- * Unknown syscall numbers return -1 so user space can detect them.
+ * Unknown syscall numbers return -ENOSYS so user space can detect them.
  * @param[in,out] tf Trap frame on the kernel stack.
  * @return Value to be written into tf->a0 by trap.c.
  * -------------------------------------------------------------------- */
@@ -638,7 +943,25 @@ long do_syscall(struct trap_frame *tf)
     case SYS_MMAP:
         return sys_mmap((void *)tf->a0, (unsigned long)tf->a1,
                         (int)tf->a2, (int)tf->a3);
+    case SYS_OPEN:
+        return sys_open((const char *)tf->a0, (int)tf->a1);
+    case SYS_CLOSE:
+        return sys_close((int)tf->a0);
+    case SYS_READ:
+        return sys_read((int)tf->a0, (void *)tf->a1,
+                        (unsigned long)tf->a2);
+    case SYS_WRITE:
+        return sys_write((int)tf->a0, (const void *)tf->a1,
+                         (unsigned long)tf->a2);
+    case SYS_MKDIR:
+        return sys_mkdir((const char *)tf->a0, (unsigned int)tf->a1);
+    case SYS_MOUNT:
+        return sys_mount((const char *)tf->a0, (const char *)tf->a1,
+                         (const char *)tf->a2, (unsigned long)tf->a3,
+                         (const void *)tf->a4);
+    case SYS_CHDIR:
+        return sys_chdir((const char *)tf->a0);
     default:
-        return -1;
+        return -ENOSYS;
     }
 }

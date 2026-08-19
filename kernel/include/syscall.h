@@ -6,8 +6,12 @@
 /*
  * RISC-V Linux-style syscall ABI.
  *   a7        : syscall number
- *   a0..a2    : arguments (only the first three are used by these calls)
+ *   a0..a4    : arguments (mount() uses all five; most calls use fewer)
  *   a0 (out)  : return value, written back into the trap frame by trap.c
+ *
+ * A failing call returns a NEGATED errno (see errno.h), so a caller
+ * separates an error from a valid non-negative result — a descriptor or
+ * a byte count — with a single sign test.
  */
 #define SYS_GETPID      0
 #define SYS_UART_READ   1
@@ -23,6 +27,13 @@
 #define SYS_SIGRETURN   11
 #define SYS_KILL        12
 #define SYS_MMAP        13
+#define SYS_OPEN        14
+#define SYS_CLOSE       15
+#define SYS_READ        16
+#define SYS_WRITE       17
+#define SYS_MKDIR       18
+#define SYS_MOUNT       19
+#define SYS_CHDIR       20
 
 /** ----------------------------------------------------------------------
  * @brief do_syscall() – Top-level dispatcher for U-mode ecalls.

@@ -152,6 +152,9 @@ struct thread *thread_alloc_bare(void)
     t->kstack_base = stk;
     t->kstack_size = KSTACK_SIZE;
     t->parent      = get_current();
+    /* Inherit the creator's working directory; the fd table stays empty
+     * (zeroed above) because only fork() duplicates open files. */
+    t->cwd         = t->parent ? t->parent->cwd : NULL;
     INIT_LIST_HEAD(&t->link);
     INIT_LIST_HEAD(&t->children);
     INIT_LIST_HEAD(&t->sibling);

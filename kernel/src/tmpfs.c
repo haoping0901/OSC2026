@@ -141,6 +141,15 @@ static struct tmpfs_node *tmpfs_new_node(const char *name,
  *
  * A miss is normal control flow — vfs_open() relies on it to decide
  * whether O_CREAT should create the file — so nothing is printed here.
+ *
+ * "." and ".." are answered from the node itself rather than the entry
+ * array, because tmpfs never stores them as real entries. ".." reads
+ * node->parent, which tmpfs_add_entry() sets to the owning directory and
+ * tmpfs_alloc_node() points at the node itself for a root: that
+ * self-loop is what makes ".." at a file-system root stay put without a
+ * special case here. Climbing out of a MOUNTED root is not tmpfs's
+ * business — the generic layer steps off the mount before asking, since
+ * only it knows what the mount covers.
  * @param[in]  dir_node       Directory to search.
  * @param[out] target         Vnode of the matching entry.
  * @param[in]  component_name Name to match exactly.
@@ -155,6 +164,18 @@ static int tmpfs_lookup(struct vnode *dir_node, struct vnode **target,
     struct tmpfs_node *dir = (struct tmpfs_node *)dir_node->internal;
     if (!dir || dir->type != TMPFS_TYPE_DIR)
         return -1;
+
+    if (str_eq(component_name, ".")) {
+        *target = dir_node;
+        return 0;
+    }
+
+    if (str_eq(component_name, "..")) {
+        /* A node built by tmpfs always has a parent (its root points at
+         * itself), so the fallback only guards a malformed node. */
+        *target = dir->parent ? dir->parent->vnode : dir_node;
+        return 0;
+    }
 
     for (int i = 0; i < dir->entry_count; i++) {
         if (str_eq(dir->entries[i]->name, component_name)) {
